@@ -67,8 +67,6 @@ CIRCUIT_FAIL_THRESHOLD = 3
 CIRCUIT_RECOVERY_SECONDS = 60
 QUALITY_WINDOW = 20
 POLL_MAX_COUNT = 20
-HEALTHY_POLL_INTERVAL = 1800   # 自适应：健康模型自动探测间隔（秒）
-UNHEALTHY_POLL_INTERVAL = 60   # 自适应：故障模型自动探测间隔（秒）
 CALL_LOG_MAX = 100
 
 
@@ -507,6 +505,8 @@ def record_fail(key: str):
     if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
         cb["open_until"] = time.time() + CIRCUIT_RECOVERY_SECONDS
         logger.warning("circuit opened: %s", key)
+    # 被动探测：转发失败即同步更新健康状态，反映到前端面板
+    health_status[key] = {"status": "fail", "checked_at": time.time()}
 
 
 def record_success(key: str):
@@ -514,6 +514,8 @@ def record_success(key: str):
     if cb:
         cb["fails"] = 0
         cb["open_until"] = 0
+    # 被动探测：转发成功即同步更新健康状态，反映到前端面板
+    health_status[key] = {"status": "ok", "checked_at": time.time()}
 
 
 # ============================================================
@@ -681,76 +683,28 @@ async def poll_all():
         if details:
             model_details.update(details)
 
-    while True:
-        try:
-            now = time.time()
-            # 自适应：按上次状态筛选到期模型（健康 30 分钟，故障 60 秒）
-            due_tasks = []
-            for p in list(providers):
-                for m in get_enabled_models(p):
-                    k = f"{p['name']}||{m}"
-                    st = health_status.get(k, {})
-                    last = st.get("checked_at", 0)
-                    interval = UNHEALTHY_POLL_INTERVAL if st.get("status") in ("fail", "error") else HEALTHY_POLL_INTERVAL
-                    if now - last >= interval:
-                        due_tasks.append((p["name"], m, p["base_url"], p["api_key"]))
-
-            if not due_tasks:
-                poll_stage = "idle"
-                await asyncio.sleep(30)
-                continue
-
-            # 混合检查：先做 provider 级 /models 预检（0 token），失败则跳过该 provider 的 chat
-            by_provider = {}
-            for name, m, url, key in due_tasks:
-                by_provider.setdefault(url, []).append((name, m, key))
-
-            async def alive_one(url):
-                key = by_provider[url][0][2]
-                r = await verify_provider_key_impl(url, key)
-                return url, r.get("ok", False)
-
-            provider_alive = dict(await asyncio.gather(*[alive_one(u) for u in by_provider]))
-
-            filtered_tasks = []
-            offline = {}
-            for url, items in by_provider.items():
-                if provider_alive.get(url):
-                    for name, m, key in items:
-                        filtered_tasks.append((name, m, url, key))
-                else:
-                    for name, m, _ in items:
-                        offline[f"{name}||{m}"] = {"status": "error", "detail": "provider 离线或 key 无效", "checked_at": now}
-
-            poll_stage = "running"
-
-            if offline:
-                health_status.update(offline)
-                for k, v in offline.items():
-                    update_model_quality(k, v)
-                await append_history(offline)
-
-            if filtered_tasks:
-                new_status = await run_health_checks(filtered_tasks)
-                health_status.update(new_status)
-                await append_history(new_status)
-                ok_count = sum(1 for v in new_status.values() if v.get("status") == "ok")
-                logger.info("poll done: %d/%d ok (adaptive, %d offline)", ok_count, len(new_status), len(offline))
-            else:
-                logger.info("poll: all providers offline, skipped chat checks")
-
-            await maybe_cleanup_history()
-            poll_count_state += 1
-            app_config["poll_count"] = poll_count_state
-            save_config()
-            last_poll_time = time.time()
-            last_check_time = last_poll_time
-
-        except Exception:
-            logger.exception("poll_all loop error")
-
-        # 每 30 秒醒来一次，重新计算到期模型
-        await asyncio.sleep(30)
+    # 启动时做 1 次全量探测（了解初始状态），之后不再主动探测，靠转发被动更新
+    poll_stage = "running"
+    try:
+        tasks = []
+        for p in list(providers):
+            for m in get_enabled_models(p):
+                tasks.append((p["name"], m, p["base_url"], p["api_key"]))
+        if tasks:
+            new_status = await run_health_checks(tasks)
+            health_status.update(new_status)
+            await append_history(new_status)
+            ok_count = sum(1 for v in new_status.values() if v.get("status") == "ok")
+            logger.info("startup poll done: %d/%d ok", ok_count, len(new_status))
+        last_poll_time = time.time()
+        last_check_time = last_poll_time
+        poll_count_state += 1
+        app_config["poll_count"] = poll_count_state
+        save_config()
+    except Exception:
+        logger.exception("startup poll error")
+    finally:
+        poll_stage = "idle"
 
 
 # ============================================================
