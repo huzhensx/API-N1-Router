@@ -1308,6 +1308,20 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
     raise HTTPException(404, "未找到")
 
 
+@app.post("/api/providers/{name}/test-model")
+async def test_model_endpoint(name: str, request: Request, _=Depends(verify_admin)):
+    """测试指定模型 ID 是否可调（发一次最小 chat 请求，max_tokens=5）。"""
+    body = await request.json()
+    model = (body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "model 不能为空")
+    for p in providers:
+        if p["name"] == name:
+            result = await check_model(p["base_url"], p["api_key"], model)
+            return result
+    raise HTTPException(404, "未找到")
+
+
 @app.put("/api/providers/{name}")
 async def update_provider(name: str, data: ProviderUpdate, _=Depends(verify_admin)):
     async with providers_lock:
