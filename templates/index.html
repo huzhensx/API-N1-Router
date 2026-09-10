@@ -362,11 +362,12 @@ table { width: 100%; border-collapse: collapse; }
 
 th {
   background: rgba(0, 0, 0, 0.02);
-  padding: 10px 16px;
+  padding: 10px 12px;
   text-align: left;
   font-size: 12px;
   color: var(--text-secondary);
   font-weight: 600;
+  white-space: nowrap;
   border-bottom: 1px solid rgba(0,0,0,0.05);
 }
 [data-theme="dark"] th { background: rgba(255, 255, 255, 0.03); border-bottom: 1px solid rgba(0,0,0,0.5); font-weight: 500;}
@@ -404,7 +405,7 @@ tbody tr:last-child td { border-bottom: none; }
 .avail-bar-fill { height: 100%; border-radius: 3px; transition: width 1s ease; }
 .avail-text { font-variant-numeric: tabular-nums; font-weight: 500; font-size: 12px; width: 40px;}
 
-.latency { font-variant-numeric: tabular-nums; }
+.latency { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .latency.fast { color: var(--success); }
 .latency.medium { color: var(--warning); }
 .latency.slow { color: var(--danger); }
@@ -1127,13 +1128,17 @@ async function load() {
       });
     });
 
-    document.getElementById('providersSection').innerHTML = providersHtml;
+    // 提供商数据未变化时跳过重建，消除每 5s 的无谓 DOM churn
+    if (window._lastProvidersHtml !== providersHtml) {
+      window._lastProvidersHtml = providersHtml;
+      document.getElementById('providersSection').innerHTML = providersHtml;
 
-    const providerSelect = document.getElementById('providerFilter');
-    const currentVal = providerSelect.value;
-    providerSelect.innerHTML = providerOptionsHtml;
-    if ([...providerSelect.options].some(o => o.value === currentVal)) {
-      providerSelect.value = currentVal;
+      const providerSelect = document.getElementById('providerFilter');
+      const currentVal = providerSelect.value;
+      providerSelect.innerHTML = providerOptionsHtml;
+      if ([...providerSelect.options].some(o => o.value === currentVal)) {
+        providerSelect.value = currentVal;
+      }
     }
 
     loadStability();
@@ -1186,14 +1191,18 @@ function renderUsage(data) {
     { label: '合计 Token', value: t.tt },
     { label: '请求数', value: t.requests },
   ];
-  document.getElementById('usageOverview').innerHTML = cards.map(c =>
+  const cardsHtml = cards.map(c =>
     `<div class="provider-card" style="padding: 14px 16px;">
        <div style="font-size: 12px; color: var(--text-secondary);">${c.label}</div>
        <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}</div>
      </div>`
   ).join('');
+  if (window._lastUsageCards !== cardsHtml) {
+    window._lastUsageCards = cardsHtml;
+    document.getElementById('usageOverview').innerHTML = cardsHtml;
+  }
   const rows = data.by_model || [];
-  document.getElementById('usageBody').innerHTML = rows.length
+  const rowsHtml = rows.length
     ? rows.map(r => `<tr>
         <td>
           <div class="model-name" style="display: flex; align-items: center;">
@@ -1207,6 +1216,10 @@ function renderUsage(data) {
         <td>${fmtNum(r.tt)}</td>
       </tr>`).join('')
     : '<tr><td colspan="5" class="empty">暂无消耗记录</td></tr>';
+  if (window._lastUsageRows !== rowsHtml) {
+    window._lastUsageRows = rowsHtml;
+    document.getElementById('usageBody').innerHTML = rowsHtml;
+  }
 }
 
 function renderStability() {
@@ -1225,11 +1238,15 @@ function renderStability() {
 
   const tbody = document.getElementById('stableBody');
   if (!filtered.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">No records found in this timeframe.</td></tr>';
+    if (tbody.dataset.state !== 'empty') {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No records found in this timeframe.</td></tr>';
+      tbody.dataset.state = 'empty';
+    }
     return;
   }
+  if (tbody.dataset.state !== 'rows') tbody.dataset.state = 'rows';
 
-  tbody.innerHTML = filtered.map(d => {
+  const rowsHtml = filtered.map(d => {
     const pct = typeof d.availability === 'number' ? d.availability.toFixed(1) : parseFloat(d.availability || 0).toFixed(1);
     const barColor = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--danger)';
     const avgL = d.avg_latency_ms !== null ? Math.round(d.avg_latency_ms) + ' ms' : '--';
@@ -1249,7 +1266,10 @@ function renderStability() {
       lastStatusHtml = `<span title="上次巡检：等待中..." style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-secondary);margin-left:6px;"></span>`;
     }
 
-    return `<tr>
+    // 行签名：所有渲染输入拼接，sig 未变的行不做 DOM 替换（防整表重建闪烁）
+    const sig = [d.provider, d.model, pct, ctxLen, d.checks, d.ok, d.fail, d.error, avgL, minL, maxL, d.last_status || '', detail.desc ? 'd' : ''].join('|');
+
+    return `<tr data-sig="${sig}">
       <td>
         <div class="model-name" style="display: flex; align-items: center;">
           <span class="model-provider-badge">${d.provider}</span>
@@ -1281,6 +1301,21 @@ function renderStability() {
       </td>
     </tr>`;
   }).join('');
+
+  // 行级 diff 更新：sig 相同的行保持原 DOM（悬停状态、动画均不中断），仅替换内容变化的行
+  const tmp = document.createElement('tbody');
+  tmp.innerHTML = rowsHtml;
+  const newRows = Array.from(tmp.children);
+  const oldRows = Array.from(tbody.children);
+  if (oldRows.length !== newRows.length) {
+    tbody.innerHTML = rowsHtml; // 行数变化（筛选/模型增减）才整体重建
+  } else {
+    for (let i = 0; i < newRows.length; i++) {
+      if (oldRows[i].dataset.sig === newRows[i].dataset.sig) continue;
+      if (oldRows[i].querySelector('input')) continue; // 行内编辑中：保护该行输入框，其余行照常平滑更新，避免保存后积压变化一次性爆发
+      oldRows[i].replaceWith(newRows[i]);
+    }
+  }
 }
 
 async function checkAll() {
@@ -1314,9 +1349,17 @@ async function updatePollStatus() {
       const date = new Date(d.last_poll_time * 1000);
       const pad = n => String(n).padStart(2, '0');
       const timeStr = `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-      document.getElementById('pollStatus').innerHTML = `上次同步：<span style="color:var(--text-primary);font-weight:500">${timeStr}</span> ${pollProg} <span style="margin:0 8px;color:rgba(255,255,255,0.2)">|</span> 已扫描 <span style="color:var(--text-primary);font-weight:500">${d.total_models}</span> 个模型`;
+      const html = `上次同步：<span style="color:var(--text-primary);font-weight:500">${timeStr}</span> ${pollProg} <span style="margin:0 8px;color:rgba(255,255,255,0.2)">|</span> 已扫描 <span style="color:var(--text-primary);font-weight:500">${d.total_models}</span> 个模型`;
+      if (window._lastPollHtml !== html) {
+        window._lastPollHtml = html;
+        document.getElementById('pollStatus').innerHTML = html;
+      }
     } else {
-      document.getElementById('pollStatus').textContent = `${stageText} ${d.total_models} 个模型待扫描`;
+      const txt = `${stageText} ${d.total_models} 个模型待扫描`;
+      if (window._lastPollHtml !== txt) {
+        window._lastPollHtml = txt;
+        document.getElementById('pollStatus').textContent = txt;
+      }
     }
   } catch (e) {
     if (e.message !== 'Unauthorized') {}
@@ -2194,36 +2237,47 @@ document.addEventListener('click', e => {
   if (!cell || cell.querySelector('input')) return;
   const model = cell.dataset.model;
   const raw = cell.textContent.replace(/,/g, '').trim();
+  const td = cell.closest('td');
+  const tdW = td.offsetWidth;
+  td.style.minWidth = tdW + 'px';
+  td.style.maxWidth = tdW + 'px';
+  cell.style.display = 'block';
+  window._ctxEditing = true;
   const input = document.createElement('input');
   input.type = 'number';
   input.value = raw === '--' ? '' : raw;
-  input.style.cssText = 'width:100px;padding:2px 4px;font-size:12px;font-family:ui-monospace,monospace;border:1px solid var(--accent-primary);border-radius:4px;background:#fff;color:var(--text-primary);outline:none;box-sizing:border-box;';
+  input.style.cssText = 'width:66px;max-width:100%;box-sizing:border-box;padding:2px 4px;font-size:12px;font-family:ui-monospace,monospace;border:1px solid var(--accent-primary);border-radius:4px;background:var(--mac-bg);color:var(--text-primary);outline:none;';
   cell.textContent = '';
   cell.appendChild(input);
   input.focus(); input.select();
   let done = false;
   const finish = async (save) => {
     if (done) return; done = true;
-    if (!save) { cell.textContent = raw; return; }
+    // 列宽锁保持到整个流程结束（含网络请求）：请求等待期间输入框仍在单元格内，
+    // 若提前解锁，inline span 中的输入框会撑动列宽，请求返回后又变回文本 → 列宽两次变化 = 闪烁
+    const releaseLock = () => { td.style.minWidth = ''; td.style.maxWidth = ''; cell.style.display = ''; };
+    if (!save) { window._ctxEditing = false; cell.textContent = raw; releaseLock(); return; }
     const v = parseInt(input.value, 10);
-    if (!v || v <= 0) { cell.textContent = raw; return; }
+    if (!v || v <= 0) { window._ctxEditing = false; cell.textContent = raw; releaseLock(); return; }
     try {
       const r = await apiFetch('/api/context-limits', {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: model, context_length: v })
       });
+      window._ctxEditing = false;
       if (r.ok) {
         showToast(`已更新 ${model} = ${v}`, 'ok');
         if (modelDetails[model]) modelDetails[model].context_length = v;
         else modelDetails[model] = { context_length: v };
-        cell.textContent = String(v);
-        loadStability();
+        cell.textContent = String(v); // 原地更新单元格即可，不整表重渲染（防闪烁）
       }
       else { showToast('更新失败', 'error'); cell.textContent = raw; }
     } catch (e) {
+      window._ctxEditing = false;
       if (e.message !== 'Unauthorized') { console.error(e); showToast('请求错误', 'error'); }
       cell.textContent = raw;
     }
+    releaseLock(); // 文本已就位后才解锁列宽，避免中间态抖动
   };
   input.addEventListener('blur', () => finish(true));
   input.addEventListener('keydown', ev => {
