@@ -57,7 +57,7 @@ USAGE_FILE = DATA_DIR / "usage.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -90,15 +90,82 @@ def load_config():
         data.setdefault("port", 8000)
         data.setdefault("poll_count", 0)
         data.setdefault("last_daily_poll", "")
+        data.setdefault("proxy", {"mode": "none", "host": "", "port": ""})
         return data
     data = {
         "local_api_key": "sk-local-" + secrets.token_hex(16),
         "port": 8000,
         "poll_count": 0,
         "last_daily_poll": "",
+        "proxy": {"mode": "none", "host": "", "port": ""},
     }
     atomic_write(CONFIG_FILE, json.dumps(data, indent=2))
     return data
+
+
+def _read_system_proxy() -> str | None:
+    """读取 Windows 系统代理设置（注册表 HKCU\\...\\Internet Settings）。
+    仅读取、不写入注册表。返回 http://host:port 或 None。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0, winreg.KEY_READ,
+        )
+        try:
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if enable != 1:
+                return None
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            if not server:
+                return None
+            # ProxyServer 格式可能是 "host:port" 或 "http=host:port;https=host:port"
+            # 简单情况：直接 host:port
+            if "=" in server:
+                # 取 http= 部分，没有则取第一个
+                for part in server.split(";"):
+                    if part.startswith("http="):
+                        return "http://" + part[5:]
+                    if "=" not in part:
+                        return "http://" + part
+                # fallback: 取第一个 = 后的值
+                first = server.split(";")[0]
+                if "=" in first:
+                    return "http://" + first.split("=", 1)[1]
+            else:
+                return "http://" + server
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return None
+
+
+def build_proxy_url(proxy_cfg: dict) -> str | None:
+    """根据 proxy 配置构建 httpx 代理 URL。
+    mode: none / system / http / socks5
+    返回 None 表示不使用代理。"""
+    if not proxy_cfg:
+        return None
+    mode = proxy_cfg.get("mode", "none")
+    if mode == "none":
+        return None
+    if mode == "system":
+        return _read_system_proxy()
+    host = (proxy_cfg.get("host") or "").strip()
+    port = proxy_cfg.get("port", "")
+    if not host:
+        return None
+    if mode == "http":
+        scheme = "http://"
+    elif mode == "socks5":
+        scheme = "socks5://"
+    else:
+        return None
+    port_str = str(port).strip()
+    if port_str:
+        return f"{scheme}{host}:{port_str}"
+    return f"{scheme}{host}"
 
 
 def save_config():
@@ -720,9 +787,11 @@ async def lifespan(app: FastAPI):
         logging.getLogger().addHandler(_fh)
     except Exception:
         pass
+    _proxy_url = build_proxy_url(app_config.get("proxy", {}))
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=10.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        proxy=_proxy_url,
     )
     app.state.http = http_client
     poll_task = asyncio.create_task(poll_all())
@@ -1195,6 +1264,46 @@ async def set_vision_assist(data: dict, _=Depends(verify_admin)):
     return {"enabled": enabled}
 
 
+# ---------- 代理配置 ----------
+@app.get("/api/proxy")
+async def get_proxy(_=Depends(verify_admin)):
+    """返回当前代理配置"""
+    return app_config.get("proxy", {"mode": "none", "host": "", "port": ""})
+
+
+@app.put("/api/proxy")
+async def set_proxy(data: dict, _=Depends(verify_admin)):
+    """保存代理配置并重建 http_client 以生效。
+    mode: none / system / http / socks5
+    system: 读取 Windows 系统代理设置（仅读取注册表，不写入）。"""
+    mode = data.get("mode", "none")
+    if mode not in ("none", "system", "http", "socks5"):
+        raise HTTPException(400, "mode 必须为 none / system / http / socks5")
+    host = (data.get("host") or "").strip()
+    port = str(data.get("port") or "").strip()
+    if mode not in ("none", "system") and not host:
+        raise HTTPException(400, "代理地址不能为空")
+    proxy_cfg = {"mode": mode, "host": host, "port": port}
+    app_config["proxy"] = proxy_cfg
+    save_config()
+
+    # 重建 http_client 使代理立即对新请求生效
+    global http_client
+    if http_client:
+        try:
+            await http_client.aclose()
+        except Exception:
+            pass
+    _proxy_url = build_proxy_url(proxy_cfg)
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        proxy=_proxy_url,
+    )
+    app.state.http = http_client
+    return {"ok": True, "proxy": proxy_cfg, "message": "代理配置已保存并生效"}
+
+
 @app.post("/api/providers/preset")
 async def apply_preset(data: PresetApplyIn, _=Depends(verify_admin)):
     """一键应用预设：三平台逐个校验 key → 创建/覆盖 provider → 合并路由组。
@@ -1526,6 +1635,45 @@ def has_image(body: dict) -> bool:
     return False
 
 
+# 视觉转交播报去重：同一组图片 10 分钟内只播报一次
+# （客户端 agent 多步循环会把同一张图反复回传，若每次都播报会造成刷屏）
+_vision_announced: dict = {}
+VISION_ANNOUNCE_WINDOW = 600
+
+
+def _vision_fingerprint(body: dict) -> str:
+    """用请求中出现过的全部图片 URL 生成指纹；同一张图 → 同一指纹。"""
+    imgs = []
+    for m in (body.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    u = part.get("image_url")
+                    if isinstance(u, dict):
+                        u = u.get("url", "")
+                    imgs.append(str(u)[:200])
+    if not imgs:
+        return ""
+    return hashlib.md5("|".join(imgs).encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _should_announce_vision(fp: str) -> bool:
+    """指纹在窗口期内首次出现才返回 True。"""
+    if not fp:
+        return True
+    now = time.time()
+    for k in [k for k, t in _vision_announced.items() if now - t > VISION_ANNOUNCE_WINDOW]:
+        _vision_announced.pop(k, None)
+    last = _vision_announced.get(fp)
+    if last and now - last < VISION_ANNOUNCE_WINDOW:
+        return False
+    _vision_announced[fp] = now
+    return True
+
+
 CN_HINT = "（请用简体中文回答）"
 
 def _inject_cn_hint(body: dict):
@@ -1560,6 +1708,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
         accumulated = ""
         prefix_done = False
         max_attempts = 2 if is_router else 1
+        client_model = body.get("model")  # 客户端原始请求的模型名，用于回填 model 字段
 
         if prelude:
             yield "data: " + json.dumps({"choices": [{"delta": {"content": prelude}, "index": 0}]}, ensure_ascii=False) + "\n\n"
@@ -1634,8 +1783,13 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                             obj = json.loads(data_str)
                             if obj.get("usage"):
                                 usage_obj = obj["usage"]
-                            if "model" in obj and isinstance(obj["model"], str):
-                                obj["model"] = f"{provider['name']} · {model}"
+                            # 把 model 字段固定为「客户端请求的原始模型名」。
+                            # 若改写为「provider · model」或保留上游真实名（如 ZhipuAI/GLM-5.2），
+                            # 客户端会因 model 与请求值不一致而在每一步都判定"模型已切换"，
+                            # 表现为界面上疯狂刷出模型徽标（被误认为频繁切换模型）。
+                            # 上游真实来源只在首个内容块以正文前缀「🤖 provider · model」体现一次。
+                            if client_model and "model" in obj:
+                                obj["model"] = client_model
                             choices = obj.get("choices") or []
                             if choices:
                                 delta = choices[0].get("delta") or {}
@@ -1720,9 +1874,13 @@ async def proxy_chat(request: Request, force: bool = False):
     is_vision_request = (requested_model == "识图") or bool(requested_model and is_vision_model(requested_model))
     vision_prelude = ""
     if vision_enabled and has_image(body) and not is_vision_request:
+        fp = _vision_fingerprint(body)
+        announce = _should_announce_vision(fp)
+        logger.info("Vision assist triggered: model=%s, fp=%s, announce=%s", requested_model, fp, announce)
         if "识图" in ROUTERS:
             requested_model = "识图"
-            vision_prelude = "🖼️ 已切换到视觉模型回复…\n\n"
+            if announce:
+                vision_prelude = "🖼️ 已切换到视觉模型回复…\n\n"
             # 识图模型 max_tokens 上限较低（部分仅 32768），避免客户端传的百万级值导致 upstream 400
             for key in ("max_tokens", "max_completion_tokens"):
                 if body.get(key, 0) > 16384:
@@ -1735,6 +1893,8 @@ async def proxy_chat(request: Request, force: bool = False):
     candidates = pick_available_models(requested_model, force=force)
     if not candidates:
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
+
+    logger.info("Request: model=%s → candidates=%d, first=%s", requested_model, len(candidates), candidates[0] if candidates else None)
 
     is_router = requested_model in ROUTERS
     stream = body.get("stream", False)
@@ -1776,7 +1936,9 @@ async def proxy_chat(request: Request, force: bool = False):
                     parsed_str = restore_hermes_text(parsed_str)
                     parsed = json.loads(parsed_str)
                     record_success(k)
-                    parsed["model"] = f"{provider['name']} · {model}"
+                    # 同流式：model 字段回填为客户端原始请求名，避免客户端判定"模型已切换"
+                    if body.get("model"):
+                        parsed["model"] = body["model"]
                     try:
                         u = parsed.get("usage") or {}
                         pt = u.get("prompt_tokens", 0) or 0
@@ -1863,7 +2025,27 @@ MODELS_CACHE_TTL = 30
 # ============================================================
 @app.get("/api/call-log")
 async def get_call_log(_=Depends(verify_admin)):
-    return list(call_log)
+    """返回调用记录。优先从内存 deque 读取；若为空则从 usage.jsonl 重建（兼容重启后恢复）。"""
+    logs = list(call_log)
+    if logs:
+        return logs
+
+    # 内存为空时，从 usage.jsonl 重建最近记录
+    try:
+        records = await read_usage(days=7)
+        rebuilt = []
+        for r in records[-100:]:  # 最多100条
+            ts = r.get("ts", 0)
+            rebuilt.append({
+                "time": time.strftime("%H:%M:%S", time.localtime(ts)),
+                "provider": r.get("provider", "unknown"),
+                "model": r.get("model", "unknown"),
+                "status": "ok",
+                "tokens": r.get("tt", 0),
+            })
+        return rebuilt
+    except Exception:
+        return []
 
 
 # ============================================================

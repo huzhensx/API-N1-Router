@@ -495,6 +495,50 @@ input:checked + .slider:before { transform: translateX(14px); }
 .model-checkbox-item input[type="checkbox"] { margin-right: 12px; width: 16px; height: 16px; cursor: pointer; }
 .model-checkbox-label { flex: 1; font-size: 14px; font-weight: 500; word-break: break-all;}
 
+/* ===== 路由配置卡片：标题/模型名单行省略，删除按钮不被挤压变形 ===== */
+.router-card {
+  flex: 1 0 320px; min-width: 320px; max-width: 900px; align-self: stretch;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--mac-border); border-radius: 8px; padding: 12px;
+  background: rgba(255,255,255,0.4);
+}
+[data-theme="dark"] .router-card { background: rgba(0,0,0,0.2); }
+.router-card-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; margin-bottom: 8px; flex: 0 0 auto;
+}
+.router-card-title {
+  font-weight: 600; font-size: 14px;
+  flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.router-card-title .router-card-hint {
+  font-size: 11px; color: var(--text-secondary); font-weight: 400;
+}
+.router-card-del {
+  flex: 0 0 auto; white-space: nowrap;
+  padding: 3px 10px; font-size: 11px; line-height: 1.5;
+  color: var(--danger);
+}
+.router-card-body {
+  display: flex; flex-direction: column; gap: 4px;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+}
+.router-card .model-checkbox-item { padding: 6px 10px; margin-bottom: 0; }
+.router-card .model-checkbox-item input[type="checkbox"] { margin-right: 8px; flex: 0 0 auto; }
+.router-card .model-checkbox-label {
+  word-break: normal; white-space: nowrap; overflow: hidden;
+  display: flex; align-items: center; min-width: 0; font-size: 13px;
+}
+.router-card .model-provider-badge { flex: 0 0 auto; }
+.router-card .router-model-name {
+  flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.router-card .router-model-ctx {
+  flex: 0 0 auto; color: var(--text-secondary); font-size: 11px; margin-left: 4px;
+}
+
 /* 提供商编辑表单 */
 .form-field { margin-bottom: 14px; }
 .form-field > label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
@@ -639,6 +683,12 @@ input:checked + .slider:before { transform: translateX(14px); }
     </div>
     <div class="mac-title">模型监控 | 仪表盘</div>
     <div style="position:absolute; right:16px; top:50%; transform:translateY(-50%); display:flex; align-items:center; gap:8px;">
+      <button class="btn btn-icon" onclick="toggleTheme()" id="themeBtn" title="切换深色/浅色模式" style="width:28px;height:28px;font-size:14px;">
+        🌙
+      </button>
+      <button class="btn btn-icon" onclick="openSettingsModal()" id="settingsBtn" title="设置" style="width:28px;height:28px;font-size:14px;">
+        ⚙️
+      </button>
       <label class="switch-inline" title="开机自动启动">
         <input type="checkbox" id="settingsAutostart" onchange="toggleAutostart(this.checked)">
         <span class="slider-inline"></span>
@@ -658,9 +708,6 @@ input:checked + .slider:before { transform: translateX(14px); }
       </div>
       <div style="display: flex; gap: 12px;">
         <button class="btn" onclick="openRouterManager()">🔀 路由配置</button>
-        <button class="btn btn-icon" onclick="toggleTheme()" id="themeBtn" title="切换深色/浅色模式">
-          🌙
-        </button>
         <button class="btn btn-primary" onclick="checkAll()" id="checkAllBtn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.13 15.57a9 9 0 1 0 3.1-8.54L2.5 9M2.5 9V3h6"/></svg>
           立即检测
@@ -823,20 +870,60 @@ input:checked + .slider:before { transform: translateX(14px); }
 
 <!-- Router Modal -->
 <div class="modal-overlay" id="routerModal" onclick="if(event.target===this) document.getElementById('routerModal').classList.remove('show')">
-  <div class="modal-content" style="max-width: 600px;">
+  <div class="modal-content" style="width: 1090px; max-width: none; height: 680px; max-height: none;">
     <div class="modal-header">
       <div class="modal-title">🔀 自定义路由配置</div>
       <div class="mac-btn close" onclick="document.getElementById('routerModal').classList.remove('show')" style="cursor: pointer;"></div>
     </div>
-    <div class="modal-body">
-      <div style="display:flex; gap:8px; margin-bottom:12px;">
+    <div class="modal-body" style="display:flex; flex-direction:column; overflow:hidden;">
+      <div style="display:flex; gap:8px; margin-bottom:12px; flex:0 0 auto;">
         <input type="text" id="newRouterName" placeholder="路由名称 (如 vip-router)" style="flex:1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--mac-border); background: transparent; color: var(--text-primary); font-size: 13px; outline: none;">
         <button class="btn btn-primary" onclick="addRouterGroup()">+ 添加路由</button>
       </div>
-      <div id="routerListContainer" style="display:flex; flex-direction:column; gap:12px; max-height:400px; overflow-y:auto;">
+      <div id="routerListContainer" style="display:flex; flex-direction:row; flex-wrap:nowrap; align-items:stretch; gap:12px; flex:1 1 auto; min-height:0; overflow-x:auto; overflow-y:hidden; padding-bottom:4px;">
       </div>
-      <div style="margin-top:16px; display:flex; justify-content:flex-end;">
+      <div style="margin-top:16px; display:flex; justify-content:flex-end; flex:0 0 auto;">
         <button class="btn btn-primary" onclick="saveRouters()">保存所有路由</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal" onclick="if(event.target===this) document.getElementById('settingsModal').classList.remove('show')">
+  <div class="modal-content" style="max-width: 420px;">
+    <div class="modal-header">
+      <div class="modal-title">⚙️ 设置</div>
+      <div class="mac-btn close" onclick="document.getElementById('settingsModal').classList.remove('show')" style="cursor: pointer;"></div>
+    </div>
+    <div class="modal-body">
+      <div style="margin-bottom: 20px;">
+        <div style="font-size:14px; font-weight:600; margin-bottom:12px;">🌐 出站代理</div>
+        <div style="display:flex; gap:8px; margin-bottom:12px;">
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer; font-size:13px;">
+            <input type="radio" name="proxyMode" value="none" onchange="onProxyModeChange()"> 不使用代理
+          </label>
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer; font-size:13px;">
+            <input type="radio" name="proxyMode" value="system" onchange="onProxyModeChange()"> 跟随系统
+          </label>
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer; font-size:13px;">
+            <input type="radio" name="proxyMode" value="http" onchange="onProxyModeChange()"> HTTP
+          </label>
+          <label style="display:flex; align-items:center; gap:4px; cursor:pointer; font-size:13px;">
+            <input type="radio" name="proxyMode" value="socks5" onchange="onProxyModeChange()"> SOCKS5
+          </label>
+        </div>
+        <div id="proxyHostPortRow" style="display:none; gap:8px; align-items:center;">
+          <input type="text" id="proxyHost" placeholder="代理地址 (如 127.0.0.1)" style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--mac-border); background:transparent; color:var(--text-primary); font-size:13px; outline:none;">
+          <span style="color:var(--text-secondary); font-size:13px;">:</span>
+          <input type="text" id="proxyPort" placeholder="端口" style="width:70px; padding:6px 10px; border-radius:6px; border:1px solid var(--mac-border); background:transparent; color:var(--text-primary); font-size:13px; outline:none;">
+        </div>
+        <div style="font-size:11px; color:var(--text-secondary); margin-top:8px; line-height:1.5;">
+          代理仅影响网关访问上游 LLM 的请求，不影响管理面板本身。<br>
+          SOCKS5 需程序内置支持（已含）。
+        </div>
+        <button class="btn btn-primary" onclick="saveProxyConfig()" style="margin-top:12px; width:100%;">保存代理设置</button>
       </div>
     </div>
   </div>
@@ -1781,7 +1868,29 @@ async function toggleVisionAssist(el) {
   }
 }
 
+/* 路由弹窗尺寸自适应：
+   默认 1090x680；主窗口放大/最大化时按可用空间跟随放大（88% 可用区）；
+   窗口过小时自动收缩，始终保留 40px 边距。 */
+function fitRouterModal() {
+  const overlay = document.getElementById('routerModal');
+  if (!overlay) return;
+  const box = overlay.querySelector('.modal-content');
+  if (!box) return;
+  const availW = Math.max(320, window.innerWidth - 80);
+  const availH = Math.max(240, window.innerHeight - 80);
+  const w = Math.min(availW, Math.max(1090, Math.round(availW * 0.88)));
+  const h = Math.min(availH, Math.max(680, Math.round(availH * 0.88)));
+  box.style.width = w + 'px';
+  box.style.height = h + 'px';
+}
+
+window.addEventListener('resize', () => {
+  const overlay = document.getElementById('routerModal');
+  if (overlay && overlay.classList.contains('show')) fitRouterModal();
+});
+
 async function openRouterManager() {
+  fitRouterModal();
   document.getElementById('routerModal').classList.add('show');
   document.getElementById('newRouterName').value = '';
   // 1. 拉取所有可用模型 + 模型详情（用于显示上下文长度）
@@ -1886,17 +1995,17 @@ function renderRouterList() {
       const checked = selected.has(opt.model) ? 'checked' : '';
       const ctx = (modelDetails[opt.model] || {}).context_length;
       const ctxStr = ctx ? ' · ' + ctx : '';
-      return `<label class="model-checkbox-item" style="padding:6px 10px;margin-bottom:4px;">
+      return `<label class="model-checkbox-item">
         <input type="checkbox" class="router-model-cb" data-router="${name}" value="${opt.model}" ${checked}>
-        <div class="model-checkbox-label" style="font-size:13px;"><span class="model-provider-badge">${opt.provider}</span>${opt.model}<span style="color:var(--text-secondary);font-size:11px;margin-left:4px;">${ctxStr}</span></div>
+        <div class="model-checkbox-label"><span class="model-provider-badge">${opt.provider}</span><span class="router-model-name" title="${opt.model}">${opt.model}</span><span class="router-model-ctx">${ctxStr}</span></div>
       </label>`;
     }).join('');
-    return `<div style="border:1px solid var(--mac-border);border-radius:8px;padding:12px;background:rgba(255,255,255,0.4);">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <div style="font-weight:600;font-size:14px;">🔀 ${name} <span style="font-size:11px;color:var(--text-secondary);font-weight:400;">(客户端 model 字段填这个名称即可命中)</span></div>
-        <button class="btn" style="padding:3px 8px;font-size:11px;color:var(--danger);" onclick="removeRouterGroup('${name}')">删除</button>
+    return `<div class="router-card">
+      <div class="router-card-head">
+        <div class="router-card-title">🔀 ${name} <span class="router-card-hint">(客户端 model 字段填这个名称即可命中)</span></div>
+        <button class="btn router-card-del" onclick="removeRouterGroup('${name}')">删除</button>
       </div>
-      <div style="display:flex;flex-direction:column;gap:4px;max-height:220px;overflow-y:auto;">${boxes}</div>
+      <div class="router-card-body">${boxes}</div>
     </div>`;
   }).join('');
 }
@@ -1935,7 +2044,11 @@ async function saveRouters() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(routersData)
     });
-    if (r.ok) showToast('路由配置已保存', 'ok');
+    if (r.ok) {
+      showToast('路由配置已保存', 'ok');
+      // 保存成功后自动关闭弹窗（延迟 300ms 让用户看到提示，且避开弹窗关闭动画与 toast 同时触发）
+      setTimeout(() => document.getElementById('routerModal').classList.remove('show'), 300);
+    }
     else { showToast('保存失败', 'error'); }
   } catch (e) { if (e.message !== 'Unauthorized') { console.error(e); showToast('保存请求错误', 'error'); } }
 }
@@ -2465,6 +2578,51 @@ async function toggleAutostart(enabled) {
   } catch (e) {
     document.getElementById('settingsAutostart').checked = !enabled;
     if (e.message !== 'Unauthorized') showToast('操作失败: ' + e.message, 'error');
+  }
+}
+
+/* ============ 设置弹窗（代理配置） ============ */
+async function openSettingsModal() {
+  document.getElementById('settingsModal').classList.add('show');
+  try {
+    const r = await apiFetch('/api/proxy');
+    const d = await r.json();
+    const mode = d.mode || 'none';
+    document.querySelector(`input[name="proxyMode"][value="${mode}"]`).checked = true;
+    document.getElementById('proxyHost').value = d.host || '';
+    document.getElementById('proxyPort').value = d.port || '';
+    onProxyModeChange();
+  } catch (e) {
+    if (e.message !== 'Unauthorized') console.error('load proxy failed', e);
+  }
+}
+
+function onProxyModeChange() {
+  const mode = document.querySelector('input[name="proxyMode"]:checked')?.value || 'none';
+  const row = document.getElementById('proxyHostPortRow');
+  row.style.display = (mode === 'none' || mode === 'system') ? 'none' : 'flex';
+}
+
+async function saveProxyConfig() {
+  const mode = document.querySelector('input[name="proxyMode"]:checked')?.value || 'none';
+  const host = document.getElementById('proxyHost').value.trim();
+  const port = document.getElementById('proxyPort').value.trim();
+  if (mode !== 'none' && mode !== 'system' && !host) { showToast('代理地址不能为空', 'warn'); return; }
+  try {
+    const r = await apiFetch('/api/proxy', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, host, port })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast(d.message || '代理设置已保存', 'ok');
+      document.getElementById('settingsModal').classList.remove('show');
+    } else {
+      showToast('保存失败', 'error');
+    }
+  } catch (e) {
+    if (e.message !== 'Unauthorized') showToast('保存失败: ' + e.message, 'error');
   }
 }
 
