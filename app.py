@@ -57,17 +57,37 @@ USAGE_FILE = DATA_DIR / "usage.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
 HISTORY_CLEANUP_INTERVAL = 6 * 3600
 ONE_MILLION = 1048576
-CIRCUIT_FAIL_THRESHOLD = 3
-CIRCUIT_RECOVERY_SECONDS = 60
 QUALITY_WINDOW = 20
 POLL_MAX_COUNT = 20
 CALL_LOG_MAX = 100
+
+# 单次请求最多尝试的候选数：防止一次请求把全部死源扫一遍（长时间等待后才报错）
+MAX_CANDIDATE_TRIES = 6
+
+# ---- 停用与探活（粒度 = 「上游 × 模型」组合；停用不限时，探活成功才解禁）----
+CIRCUIT_FAIL_THRESHOLD = 5          # 转发连续失败多少次 → 熔断
+CIRCUIT_FIRST_PROBE_DELAY = 300     # 熔断后多久打第一次探活（5 分钟）
+CIRCUIT_PROBE_INTERVAL = 120        # 熔断探活间隔（2 分钟）
+CIRCUIT_PROBE_FAIL_LIMIT = 5        # 连续探活失败几次 → 进入静默
+CIRCUIT_SILENCE_SECONDS = 1200      # 静默时长（20 分钟，其间完全不探活）
+CIRCUIT_SILENCE_LIMIT = 5           # 当天第几次进入静默 → 直接停用到当天零点
+BLOCK_PROBE_INTERVAL = 600          # 拉黑后的探活间隔（10 分钟）
+BLOCK_PROBE_FAIL_LIMIT = 5          # 拉黑后连续探活失败几次 → 停用到当天零点
+PROBE_SCAN_INTERVAL = 15            # 后台扫描间隔（秒）
+PROBE_CONCURRENCY = 10              # 单次探活的并发上限
+
+# 永久性错误（模型不存在 / 无权限 / 额度耗尽之类，重试也不会好）
+# 命中 1 次即把该「上游 × 模型」组合拉黑（停用），之后靠探活恢复
+PERMANENT_ERROR_CODES = {400, 401, 402, 403, 404, 410, 422}
+
+# 无转发样本时的中性质量分（原为 1.0，会让从未验证过的源排在已验证源之前）
+QUALITY_UNKNOWN = 0.5
 
 
 # ============================================================
@@ -294,12 +314,16 @@ providers = load_providers()
 health_status: dict = {}
 model_details: dict = {}
 model_quality: dict = {}          # key -> {ok, fail, error, latencies: deque}
-circuit_breaker: dict = {}        # key -> {fails, open_until}
+circuit_breaker: dict = {}        # key -> 熔断状态（临时性错误；含探活调度与静默）
+blocked: dict = {}                # key -> 拉黑状态（永久性错误；含探活调度）
+hard_disabled: dict = {}          # key -> 停用到当天零点（不再探活，跨零点自动解除）
+circuit_strikes: dict = {}        # key -> {"day", "count"} 当天进入静默的次数
 providers_lock = asyncio.Lock()
 history_lock = asyncio.Lock()
 usage_lock = asyncio.Lock()
 http_client: httpx.AsyncClient | None = None
 poll_task = None
+probe_task = None
 last_poll_time: float = 0
 last_check_time: float = time.time()
 last_history_cleanup: float = 0
@@ -537,12 +561,23 @@ def update_model_quality(key: str, info: dict):
 
 
 def get_quality_score(key: str) -> float:
-    """0~1 可用率，无数据返回 1.0（乐观）"""
+    """0~1 可用率。没有任何转发样本时返回中性分 QUALITY_UNKNOWN。
+
+    注意：以前这里返回 1.0（乐观），会让"从未被真正转发过"的候选与
+    "100% 成功"的候选同分、甚至在已验证源偶发失败时反超到第一位。
+    改为中性分后，未验证源不再抢在已验证源前面。
+    """
     q = model_quality.get(key)
     if not q or not q["status_window"]:
-        return 1.0
+        return QUALITY_UNKNOWN
     ok_count = sum(1 for s in q["status_window"] if s == "ok")
     return ok_count / len(q["status_window"])
+
+
+def has_quality_data(key: str) -> bool:
+    """该组合是否有真实转发样本（用于同分时的兜底排序：已验证明排在未验证之前）"""
+    q = model_quality.get(key)
+    return bool(q and q["status_window"])
 
 
 def get_avg_latency(key: str):
@@ -553,50 +588,378 @@ def get_avg_latency(key: str):
 
 
 # ============================================================
-# 熔断
+# 停用 / 恢复（熔断 + 拉黑 + 后台探活）
+# ------------------------------------------------------------
+# 粒度永远是「上游 × 模型」这一个组合（key = f"{provider}||{model}"），
+# 不是整家上游、也不是跨平台的模型名。
+#
+# 停用「不限时」—— 没有任何到期自动放行；唯一解除条件是
+# ① 后台探活成功，或 ② 一次真实转发成功。
+#
+#   熔断（临时性错误 429 / 5xx / 超时 / 断流）
+#     转发连续失败 5 次 → 停用；5 分钟后打第一次探活，之后每 2 分钟一次
+#     探活连续失败 5 次 → 静默 20 分钟（其间完全不探活）
+#     静默结束 → 回到每 2 分钟探活
+#     当天第 5 次进入静默 → 直接停用到当天零点，彻底停探
+#
+#   拉黑（永久性错误 400/401/402/403/404/410/422）
+#     失败 1 次即停用；触发即开始计时，每 10 分钟探活一次
+#     连续探活失败 5 次（约 50 分钟）→ 停用到当天零点，彻底停探
+#
+# 兜底：全部候选都被停用时仍会轮到它们（pick_available_models 只降权不丢弃），
+#       不会出现"无可用模型"。
+# 探活请求只写 gateway.log，不写 usage.jsonl、不进调用记录。
 # ============================================================
+def _today_str(now: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(now or time.time()))
+
+
+def _deadline_ts(now: float | None = None) -> float:
+    """当天零点的绝对时间戳"""
+    now = now or time.time()
+    lt = time.localtime(now)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)) + 86400
+
+
+def _strikes(key: str) -> int:
+    """当天累计「进入静默」的次数（跨天自动清零；探活成功不清零）"""
+    s = circuit_strikes.get(key)
+    if not s or s.get("day") != _today_str():
+        return 0
+    return int(s.get("count", 0))
+
+
+def _bump_strikes(key: str) -> int:
+    n = _strikes(key) + 1
+    circuit_strikes[key] = {"day": _today_str(), "count": n}
+    return n
+
+
+def _circuit_entry(key: str, reason: str = "") -> dict:
+    st = circuit_breaker.get(key)
+    if not st:
+        st = {"fails": 0, "probe_fails": 0, "opened_at": 0, "next_probe_at": 0,
+              "silence_until": 0, "reason": reason, "last_error": ""}
+        circuit_breaker[key] = st
+    return st
+
+
+def _enter_block(key: str, reason: str = "") -> dict:
+    """拉黑：永久性错误命中 1 次即停用。永久性错误优先于临时性错误，
+    同一组合不会同时挂在两张表上（否则会被探活两次）。"""
+    circuit_breaker.pop(key, None)
+    st = blocked.get(key)
+    if not st:
+        now = time.time()
+        st = {"since": now, "next_probe_at": now + BLOCK_PROBE_INTERVAL, "probe_fails": 0,
+              "reason": reason, "last_error": ""}
+        blocked[key] = st
+    return st
+
+
+def _clear_disable(key: str) -> bool:
+    """解除停用（探活成功 / 真实转发成功）。当天静默次数保留，便于"抖动源"继续被计数。"""
+    changed = (key in circuit_breaker) or (key in blocked) or (key in hard_disabled)
+    circuit_breaker.pop(key, None)
+    blocked.pop(key, None)
+    hard_disabled.pop(key, None)
+    return changed
+
+
+def _sweep_expired(now: float | None = None):
+    """① 零点到期的「停用至当天零点」自动解除（不探活，等自然出队）
+    ② 已从配置中消失的组合（上游被删 / 模型被取消勾选）顺手清掉运行态，避免状态表无限增长"""
+    now = now or time.time()
+    for k in [k for k, v in hard_disabled.items() if now >= (v.get("deadline") or 0)]:
+        info = hard_disabled.pop(k, None) or {}
+        logger.info("停用到期（跨零点）自动解除: %s（%s）", k, info.get("kind"))
+    for k in list(circuit_breaker) + list(blocked) + list(hard_disabled):
+        if _resolve_target(k) is None:
+            _drop_state(k)
+
+
 def is_circuit_open(key: str) -> bool:
-    cb = circuit_breaker.get(key)
-    if not cb:
-        return False
-    if cb.get("open_until") and time.time() >= cb["open_until"]:
-        cb["fails"] = 0
-        cb["open_until"] = 0
-        return False
-    return bool(cb.get("open_until"))
+    """是否因熔断（或熔断升级到零点）被停用"""
+    hd = hard_disabled.get(key)
+    if hd and hd.get("kind") == "circuit":
+        return True
+    st = circuit_breaker.get(key)
+    return bool(st and st.get("opened_at"))
 
 
-def record_fail(key: str, kind: str = "fail"):
-    cb = circuit_breaker.setdefault(key, {"fails": 0, "open_until": 0})
-    cb["fails"] += 1
-    if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
-        cb["open_until"] = time.time() + CIRCUIT_RECOVERY_SECONDS
-        logger.warning("circuit opened: %s", key)
+def is_blocked(key: str) -> bool:
+    """是否因永久性错误被拉黑（或拉黑升级到零点）"""
+    hd = hard_disabled.get(key)
+    if hd and hd.get("kind") == "block":
+        return True
+    return key in blocked
+
+
+def is_disabled(key: str) -> bool:
+    """是否处于停用中（熔断 / 拉黑 / 零点级，三者任一）"""
+    return is_blocked(key) or is_circuit_open(key)
+
+
+def disable_state(key: str) -> dict:
+    """当前停用状态（供前端徽标 / 倒计时 / 手动探活）。未停用时只返回 {"disabled": False}"""
+    now = time.time()
+    hd = hard_disabled.get(key)
+    if hd:
+        dl = hd.get("deadline") or 0
+        return {"disabled": True, "disable_kind": hd.get("kind", "circuit"), "to_deadline": True,
+                "deadline_at": dl, "probe_at": 0, "remain_sec": max(0, int(dl - now)),
+                "probe_fails": hd.get("probe_fails", 0), "silenced": False,
+                "reason": hd.get("reason", ""), "last_error": hd.get("last_error", "")}
+    st = blocked.get(key)
+    if st:
+        nxt = st.get("next_probe_at") or 0
+        return {"disabled": True, "disable_kind": "block", "to_deadline": False,
+                "deadline_at": 0, "probe_at": nxt, "remain_sec": max(0, int(nxt - now)),
+                "probe_fails": st.get("probe_fails", 0), "silenced": False,
+                "reason": st.get("reason", ""), "last_error": st.get("last_error", "")}
+    st = circuit_breaker.get(key)
+    if st and st.get("opened_at"):
+        nxt = st.get("next_probe_at") or 0
+        sil = st.get("silence_until") or 0
+        return {"disabled": True, "disable_kind": "circuit", "to_deadline": False,
+                "deadline_at": 0, "probe_at": nxt, "remain_sec": max(0, int(nxt - now)),
+                "probe_fails": st.get("probe_fails", 0), "silenced": sil > now,
+                "silence_remain_sec": max(0, int(sil - now)) if sil > now else 0,
+                "strikes": _strikes(key),
+                "reason": st.get("reason", ""), "last_error": st.get("last_error", "")}
+    return {"disabled": False}
+
+
+def _resolve_target(key: str):
+    """把 key 还原成 (provider, model)；组合已不存在 / 已停用时返回 None"""
+    if "||" not in key:
+        return None
+    name, model = key.split("||", 1)
+    for p in providers:
+        if p["name"] == name:
+            if model in (p.get("models") or []) and model not in (p.get("disabled_models") or []):
+                return p, model
+            return None
+    return None
+
+
+def _drop_state(key: str):
+    """组合已从配置中消失：顺手清掉它的全部运行态，避免状态表无限增长"""
+    circuit_breaker.pop(key, None)
+    blocked.pop(key, None)
+    hard_disabled.pop(key, None)
+    circuit_strikes.pop(key, None)
+
+
+def _probe_due_keys(now: float) -> list[str]:
+    """挑出"到点该探活"的停用组合（只含仍存在且启用的组合）"""
+    due, seen = [], set()
+    for table in (circuit_breaker, blocked):
+        for k, st in list(table.items()):
+            if k in seen:
+                continue
+            nxt = st.get("next_probe_at") or 0
+            if nxt and now >= nxt:
+                due.append(k)
+                seen.add(k)
+    return [k for k in due if _resolve_target(k)]
+
+
+async def _run_probes(pairs: list[tuple[str, str, str, str]]) -> dict:
+    """并发执行探活请求。pairs: (key, base_url, api_key, model)"""
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def one(key, url, ak, m):
+        async with sem:
+            return key, await check_model(url, ak, m)
+
+    gathered = await asyncio.gather(*[one(*p) for p in pairs], return_exceptions=True)
+    out = {}
+    for item in gathered:
+        if isinstance(item, Exception):
+            continue
+        out[item[0]] = item[1]
+    return out
+
+
+def _probe_result(key: str, result: dict):
+    """处理一次探活结果：成功即解禁；失败按所在表推进探活计数 / 静默 / 升级零点"""
+    now = time.time()
+    code = result.get("code")
+    detail = err_snippet(result.get("detail") or "")
+    summary = (f"HTTP {code} {detail}".strip() if code else (detail or "连接失败"))
+
+    if result.get("status") == "ok":
+        _clear_disable(key)
+        health_status[key] = {"status": "ok", "checked_at": now}
+        update_model_quality(key, {"status": "ok"})
+        logger.info("探活成功，解除停用: %s（%sms）", key, result.get("latency_ms", "-"))
+        return
+
+    st = blocked.get(key)
+    if st is not None:
+        st["probe_fails"] = int(st.get("probe_fails", 0)) + 1
+        st["last_error"] = summary
+        if st["probe_fails"] >= BLOCK_PROBE_FAIL_LIMIT:
+            blocked.pop(key, None)
+            hard_disabled[key] = {
+                "since": st.get("since") or now, "kind": "block", "deadline": _deadline_ts(now),
+                "probe_fails": st["probe_fails"], "last_error": summary,
+                "reason": f"拉黑后连续探活失败 {BLOCK_PROBE_FAIL_LIMIT} 次"}
+            logger.warning("拉黑升级为「停用到当天零点」（探活失败 %d 次）: %s（%s）",
+                           st["probe_fails"], key, summary)
+        else:
+            st["next_probe_at"] = now + BLOCK_PROBE_INTERVAL
+            logger.info("拉黑探活失败 %d/%d: %s（%s），%d 分钟后重试",
+                        st["probe_fails"], BLOCK_PROBE_FAIL_LIMIT, key, summary, BLOCK_PROBE_INTERVAL // 60)
+        return
+
+    st = circuit_breaker.get(key)
+    if st is None:
+        return
+    st["probe_fails"] = int(st.get("probe_fails", 0)) + 1
+    st["last_error"] = summary
+    if st["probe_fails"] >= CIRCUIT_PROBE_FAIL_LIMIT:
+        st["probe_fails"] = 0
+        n = _bump_strikes(key)
+        if n >= CIRCUIT_SILENCE_LIMIT:
+            circuit_breaker.pop(key, None)
+            hard_disabled[key] = {
+                "since": st.get("opened_at") or now, "kind": "circuit", "deadline": _deadline_ts(now),
+                "probe_fails": CIRCUIT_PROBE_FAIL_LIMIT, "last_error": summary,
+                "reason": f"当天第 {n} 次进入静默"}
+            logger.warning("熔断升级为「停用到当天零点」（当天第 %d 次静默）: %s（%s）", n, key, summary)
+        else:
+            st["silence_until"] = now + CIRCUIT_SILENCE_SECONDS
+            st["next_probe_at"] = now + CIRCUIT_SILENCE_SECONDS
+            logger.info("熔断探活连续失败 %d 次 → 静默 %d 分钟（当天第 %d 次）: %s（%s）",
+                        CIRCUIT_PROBE_FAIL_LIMIT, CIRCUIT_SILENCE_SECONDS // 60, n, key, summary)
+    else:
+        st["next_probe_at"] = now + CIRCUIT_PROBE_INTERVAL
+        logger.info("熔断探活失败 %d/%d: %s（%s），%d 分钟后重试",
+                    st["probe_fails"], CIRCUIT_PROBE_FAIL_LIMIT, key, summary, CIRCUIT_PROBE_INTERVAL // 60)
+
+
+async def probe_disabled(keys: list[str] | None = None, include_all: bool = False) -> dict:
+    """对被停用的组合做一次探活。
+
+    keys 给定 → 只探这些组合（前端点徽标"立即探活"）；
+    include_all=True → 探当前全部停用组合（工具栏「探活停用项」）；
+    都不给 → 只探"到点"的组合（后台循环）。
+    升级到"停用到当天零点"的组合一律不探。
+    """
+    _sweep_expired()
+    now = time.time()
+    if keys:
+        targets = [k for k in keys if k not in hard_disabled and _resolve_target(k)
+                   and (k in circuit_breaker or k in blocked)]
+    elif include_all:
+        targets = [k for k in list(circuit_breaker) + list(blocked)
+                   if k not in hard_disabled and _resolve_target(k)]
+    else:
+        targets = _probe_due_keys(now)
+
+    pairs = []
+    for k in targets:
+        t = _resolve_target(k)
+        if t is None:
+            _drop_state(k)
+            continue
+        p, m = t
+        pairs.append((k, p["base_url"], p["api_key"], m))
+    if not pairs:
+        return {}
+
+    results = await _run_probes(pairs)
+    for k, r in results.items():
+        _probe_result(k, r)
+    return {k: {"status": r.get("status"), "code": r.get("code")} for k, r in results.items()}
+
+
+async def probe_loop():
+    """后台探活循环：只对「已停用」且到了探测时间的组合发最小请求。
+
+    · 健康组合一律不探 —— 没有任何停用项时，这个循环一个上游请求都不发
+    · 探活结果只进 gateway.log，不写 usage.jsonl / 调用记录
+    """
+    await asyncio.sleep(5)   # 先让启动时的全量探测跑完
+    while True:
+        try:
+            await probe_disabled()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("probe_loop error")
+        await asyncio.sleep(PROBE_SCAN_INTERVAL)
+
+
+def classify_error(code: int | None) -> str:
+    """错误分级：permanent（模型不存在/无权限/额度耗尽…重试无用） / transient（限流、超时、断流）"""
+    if code and int(code) in PERMANENT_ERROR_CODES:
+        return "permanent"
+    return "transient"
+
+
+def err_snippet(body_text: str) -> str:
+    """从上游错误体里抽一句人能看懂的短消息（写进调用记录，便于定位"为什么失败"）"""
+    if not body_text:
+        return ""
+    try:
+        d = json.loads(body_text)
+        for path in (("error", "message"), ("detail", "error", "message"),
+                     ("detail", "message"), ("message",), ("error",), ("detail",)):
+            cur, ok = d, True
+            for key in path:
+                if isinstance(cur, dict) and key in cur:
+                    cur = cur[key]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(cur, str) and cur.strip():
+                return " ".join(cur.split())[:120]
+    except Exception:
+        pass
+    return " ".join(body_text.split())[:120]
+
+
+def record_fail(key: str, kind: str = "fail", code: int | None = None):
+    """一次真实转发失败。临时性错误累计熔断计数；永久性错误 1 次即拉黑（停用）。"""
+    level = classify_error(code)
+    if level == "permanent":
+        _enter_block(key, reason=f"永久性错误 HTTP {code}")
+        logger.warning("拉黑（永久性错误 %s，1 次即停用）: %s", code, key)
+    elif key not in blocked and key not in hard_disabled:
+        st = _circuit_entry(key, reason="转发连续失败")
+        st["fails"] = int(st.get("fails", 0)) + 1
+        if st["fails"] >= CIRCUIT_FAIL_THRESHOLD and not st.get("opened_at"):
+            st["opened_at"] = time.time()
+            st["next_probe_at"] = st["opened_at"] + CIRCUIT_FIRST_PROBE_DELAY
+            logger.warning("熔断（连续失败 %d 次），%d 分钟后开始探活: %s",
+                           st["fails"], CIRCUIT_FIRST_PROBE_DELAY // 60, key)
     # 被动探测：转发失败即同步更新健康状态，反映到前端面板
-    health_status[key] = {"status": "fail", "checked_at": time.time()}
+    health_status[key] = {"status": "fail", "checked_at": time.time(),
+                          "code": code, "level": level}
     # 被动探测：同一份转发结果同时喂给质量分，让候选排序跟随真实表现
     update_model_quality(key, {"status": kind if kind in ("fail", "error") else "fail"})
 
 
 def record_success(key: str, latency_ms: float | None = None):
-    cb = circuit_breaker.get(key)
-    if cb:
-        cb["fails"] = 0
-        cb["open_until"] = 0
+    """一次真实转发成功 → 立即解除停用（当场作废熔断 / 静默 / 拉黑 / 零点级）"""
+    _clear_disable(key)
     # 被动探测：转发成功即同步更新健康状态，反映到前端面板
     health_status[key] = {"status": "ok", "checked_at": time.time()}
     # 被动探测：同一份转发结果同时喂给质量分（延迟为 None 时只记可用率）
     update_model_quality(key, {"status": "ok", "latency_ms": latency_ms})
 
 
-# 失败状态的有效期（秒）：超期后视为"待观察"，重新允许被选中，
-# 避免一次偶发失败把某个上游永久降权。
+# 临时性失败状态的有效期（秒）：超期后视为"待观察"，重新允许被优先选中。
+# 真正的"停用"由 circuit_breaker / blocked / hard_disabled 三张表决定，与这个 TTL 无关。
 HEALTH_FAIL_TTL = 120
 
 
 def is_healthy(key: str) -> bool:
-    """候选是否健康可优先选中：熔断中 → 否；失败但已过期 → 是。"""
-    if is_circuit_open(key):
+    """候选是否健康可优先选中：停用中（拉黑 / 熔断 / 零点级）→ 否；临时失败 120 秒后可再用。"""
+    if is_disabled(key):
         return False
     st = health_status.get(key) or {}
     status = st.get("status")
@@ -800,7 +1163,7 @@ async def poll_all():
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, poll_task
+    global http_client, poll_task, probe_task
     # 运行时日志落盘（带轮转，避免无限膨胀）；放在此处确保 uvicorn 配置 logging 后再挂，不被清空
     try:
         _fh = RotatingFileHandler(DATA_DIR / "gateway.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
@@ -816,9 +1179,13 @@ async def lifespan(app: FastAPI):
     )
     app.state.http = http_client
     poll_task = asyncio.create_task(poll_all())
+    # 后台探活：只探测「已停用」的组合，健康组合一个请求都不发
+    probe_task = asyncio.create_task(probe_loop())
     yield
     if poll_task:
         poll_task.cancel()
+    if probe_task:
+        probe_task.cancel()
     await http_client.aclose()
 
 
@@ -862,6 +1229,11 @@ class ToggleModelIn(BaseModel):
     enabled: bool
 
 
+class ReorderIn(BaseModel):
+    """上游卡片拖动重排：names = 期望的 provider 顺序（只认已存在的名字）"""
+    names: list[str] = []
+
+
 class VerifyKeyIn(BaseModel):
     base_url: str
     api_key: str
@@ -882,10 +1254,13 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
     """返回按质量排序的候选 (provider, model) 列表。
 
     排序优先级：
-      ① 健康分层：熔断中 / 近期失败过的候选一律排到最后（force 时不分层）
+      ① 分层：0 = 健康；1 = 近期临时失败（120 秒内）；2 = 拉黑中（永久性错误）
+         拉黑项只降到底部、**不丢弃** —— 只有全部候选都被拉黑时才轮得到它们，
+         所以永远不会出现"无可用模型"的 503。force=True 时不分层（手动立即检测用）。
       ② 可用率降序（model_quality 滑动窗口，转发结果实时写入）
-      ③ 平均延迟升序（流式 TTFB 样本）
-    不健康的候选不会被丢弃，只是在最后兜底，避免出现"无可用模型"。
+         无样本 = 中性分 QUALITY_UNKNOWN(0.5)，不会抢在已验证源之前
+      ③ 同分时：有验证样本的排在无样本的之前
+      ④ 平均延迟升序（流式 TTFB 样本）
     """
     raw = []
 
@@ -907,15 +1282,16 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
 
     scored = [
         (
-            0 if (force or is_healthy(k)) else 1,
+            0 if force else (2 if is_disabled(k) else (0 if is_healthy(k) else 1)),
             -get_quality_score(k),
+            0 if has_quality_data(k) else 1,
             get_avg_latency(k) or 1e9,
             p,
             m,
         )
         for p, m, k in raw
     ]
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
     return [(p, m) for *_, p, m in scored]
 
 
@@ -1019,7 +1395,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     now = time.time()
     cached = _stability_cache.get(hours)
     if cached and now - cached[0] < STABILITY_CACHE_TTL:
-        return cached[1]
+        return _with_disable_state(cached[1])
     records = await read_history(hours)
     model_stats: dict = {}
     for rec in records:
@@ -1063,11 +1439,23 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "last_status": health_status.get(key, {}).get("status", "unknown"),
             "vision": is_vision_model(model),
         })
-    # 隐藏从未成功过的模型（检查过但 ok=0），新加入的模型（checks=0）正常展示
-    result = [r for r in result if not (r["checks"] > 0 and r["ok"] == 0)]
+    # 隐藏从未成功过的模型（检查过但 ok=0），新加入的模型（checks=0）正常展示；
+    # 但**当前被停用**的组合必须保留 —— 否则用户看不到停用徽标、也没法点它探活
+    result = [r for r in result
+              if not (r["checks"] > 0 and r["ok"] == 0)
+              or disable_state(f"{r['provider']}||{r['model']}").get("disabled")]
     result.sort(key=lambda x: (-x["availability"], x["avg_latency_ms"] or 99999))
     _stability_cache[hours] = (now, result)
-    return result
+    return _with_disable_state(result)
+
+
+def _with_disable_state(rows: list[dict]) -> list[dict]:
+    """给稳定性行叠加最新停用状态（缓存命中时也保证停用信息实时）"""
+    out = []
+    for r in rows:
+        st = disable_state(f"{r['provider']}||{r['model']}")
+        out.append({**r, **st} if st.get("disabled") else r)
+    return out
 
 
 @app.get("/api/usage")
@@ -1210,9 +1598,35 @@ async def list_providers(_=Depends(verify_admin)):
         }
         for m in p.get("models", []):
             k = f"{p['name']}||{m}"
-            item["health"][m] = health_status.get(k, {"status": "unknown"})
+            h = dict(health_status.get(k, {"status": "unknown"}))
+            h.update(disable_state(k))     # 附带停用类型 / 下次探活时间 / 是否零点级
+            item["health"][m] = h
         result.append(item)
     return result
+
+
+@app.post("/api/probe-now")
+async def probe_now(request: Request, _=Depends(verify_admin)):
+    """手动探活停用项。
+
+    body 可为空 → 探活当前全部停用组合；
+    也可传 {"provider": "AMD", "model": "GLM-5.2"} 或 {"keys": ["AMD||GLM-5.2"]} 只探指定组合。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    keys = [k for k in (body.get("keys") or []) if isinstance(k, str) and k]
+    if body.get("provider") and body.get("model"):
+        keys.insert(0, f"{body['provider']}||{body['model']}")
+    include_all = bool(body.get("all")) or not keys
+    before = len(circuit_breaker) + len(blocked) + len(hard_disabled)
+    results = await probe_disabled(keys=keys or None, include_all=include_all)
+    after = len(circuit_breaker) + len(blocked) + len(hard_disabled)
+    return {"ok": True, "probed": len(results), "results": results,
+            "disabled_before": before, "disabled_after": after}
 
 
 @app.post("/api/providers")
@@ -1232,6 +1646,28 @@ async def add_provider(data: ProviderIn, _=Depends(verify_admin)):
         providers.append(data.model_dump())
         save_providers(providers)
     return {"ok": True}
+
+
+@app.post("/api/providers/reorder")
+async def reorder_providers(data: ReorderIn, _=Depends(verify_admin)):
+    """按前端拖动结果重排 providers 顺序并落盘（v1.0.3）。
+
+    providers 列表顺序 = 界面卡片顺序；同时是候选排序四项键完全相同时的兜底次序
+    （`pick_available_models()` 用的是稳定排序，同分时保持 providers 原序）。
+    健壮性：只认当前确实存在的名字，多出的忽略、未提到的按原相对顺序追加到末尾。
+    """
+    global providers
+    async with providers_lock:
+        by_name = {p["name"]: p for p in providers}
+        ordered, seen = [], set()
+        for n in data.names:
+            if n in by_name and n not in seen:
+                ordered.append(by_name[n])
+                seen.add(n)
+        ordered += [p for p in providers if p["name"] not in seen]
+        providers = ordered
+        save_providers(providers)
+    return {"ok": True, "order": [p["name"] for p in providers]}
 
 
 @app.post("/api/providers/verify-key")
@@ -1443,6 +1879,8 @@ async def test_model_endpoint(name: str, request: Request, _=Depends(verify_admi
     for p in providers:
         if p["name"] == name:
             result = await check_model(p["base_url"], p["api_key"], model)
+            if result.get("status") == "ok":
+                _clear_disable(f"{name}||{model}")   # 测试通过 → 解除停用
             return result
     raise HTTPException(404, "未找到")
 
@@ -1765,20 +2203,22 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                     continue
 
                 if resp.status_code != 200:
+                    upstream_msg = ""
                     try:
-                        await resp.aread()
+                        upstream_msg = (await resp.aread()).decode("utf-8", "replace")[:300]
                     except Exception:
                         pass
                     await resp.aclose()
-                    logger.warning("upstream stream error %d from %s", resp.status_code, provider["name"])
-                    record_fail(k)
+                    logger.warning("upstream stream error %d from %s: %s",
+                                   resp.status_code, provider["name"], upstream_msg)
+                    record_fail(k, code=resp.status_code)
                     call_log.append({
                         "time": time.strftime("%H:%M:%S"),
                         "provider": provider["name"],
                         "model": model,
                         "status": "fail",
                         "tokens": 0,
-                        "error": f"HTTP {resp.status_code}",
+                        "error": f"HTTP {resp.status_code}" + (f" · {err_snippet(upstream_msg)}" if upstream_msg else ""),
                     })
                     continue
 
@@ -1914,7 +2354,20 @@ async def proxy_chat(request: Request, force: bool = False):
     if not candidates:
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
 
-    logger.info("Request: model=%s → candidates=%d, first=%s", requested_model, len(candidates), candidates[0] if candidates else None)
+    # 单次请求最多尝试 N 个候选：避免把时间全耗在一长串死源上才报错。
+    # 拉黑项排在候选末尾，正好被这条截掉（全部被拉黑时才会轮到最后那几个）。
+    total_candidates = len(candidates)
+    if total_candidates > MAX_CANDIDATE_TRIES:
+        candidates = candidates[:MAX_CANDIDATE_TRIES]
+
+    # 只打印「上游名||模型名」；绝不打印 provider 字典（那里面含 api_key 明文）
+    logger.info(
+        "Request: model=%s → candidates=%d%s, first=%s",
+        requested_model,
+        total_candidates,
+        f" (尝试前 {len(candidates)})" if len(candidates) != total_candidates else "",
+        f"{candidates[0][0].get('name')}||{candidates[0][1]}" if candidates else None,
+    )
 
     is_router = requested_model in ROUTERS
     stream = body.get("stream", False)
@@ -1938,7 +2391,7 @@ async def proxy_chat(request: Request, force: bool = False):
                 resp = await http_client.post(url, json=req_body, headers=headers, timeout=120)
                 if resp.status_code >= 400:
                     logger.warning("upstream %d from %s: %s", resp.status_code, provider["name"], resp.text[:200])
-                    record_fail(k)
+                    record_fail(k, code=resp.status_code)
                     last_err = f"upstream {resp.status_code}"
                     call_log.append({
                         "time": time.strftime("%H:%M:%S"),
@@ -1946,7 +2399,7 @@ async def proxy_chat(request: Request, force: bool = False):
                         "model": model,
                         "status": "fail",
                         "tokens": 0,
-                        "error": f"HTTP {resp.status_code}",
+                        "error": f"HTTP {resp.status_code} · {err_snippet(resp.text)}",
                     })
                     continue
                 try:
