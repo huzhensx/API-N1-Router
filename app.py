@@ -57,7 +57,7 @@ USAGE_FILE = DATA_DIR / "usage.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -566,7 +566,7 @@ def is_circuit_open(key: str) -> bool:
     return bool(cb.get("open_until"))
 
 
-def record_fail(key: str):
+def record_fail(key: str, kind: str = "fail"):
     cb = circuit_breaker.setdefault(key, {"fails": 0, "open_until": 0})
     cb["fails"] += 1
     if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
@@ -574,15 +574,36 @@ def record_fail(key: str):
         logger.warning("circuit opened: %s", key)
     # 被动探测：转发失败即同步更新健康状态，反映到前端面板
     health_status[key] = {"status": "fail", "checked_at": time.time()}
+    # 被动探测：同一份转发结果同时喂给质量分，让候选排序跟随真实表现
+    update_model_quality(key, {"status": kind if kind in ("fail", "error") else "fail"})
 
 
-def record_success(key: str):
+def record_success(key: str, latency_ms: float | None = None):
     cb = circuit_breaker.get(key)
     if cb:
         cb["fails"] = 0
         cb["open_until"] = 0
     # 被动探测：转发成功即同步更新健康状态，反映到前端面板
     health_status[key] = {"status": "ok", "checked_at": time.time()}
+    # 被动探测：同一份转发结果同时喂给质量分（延迟为 None 时只记可用率）
+    update_model_quality(key, {"status": "ok", "latency_ms": latency_ms})
+
+
+# 失败状态的有效期（秒）：超期后视为"待观察"，重新允许被选中，
+# 避免一次偶发失败把某个上游永久降权。
+HEALTH_FAIL_TTL = 120
+
+
+def is_healthy(key: str) -> bool:
+    """候选是否健康可优先选中：熔断中 → 否；失败但已过期 → 是。"""
+    if is_circuit_open(key):
+        return False
+    st = health_status.get(key) or {}
+    status = st.get("status")
+    if status in ("ok", None, "unknown"):
+        return True
+    age = time.time() - (st.get("checked_at") or 0)
+    return age >= HEALTH_FAIL_TTL
 
 
 # ============================================================
@@ -858,49 +879,44 @@ class PresetApplyIn(BaseModel):
 # 模型选择
 # ============================================================
 def pick_available_models(model: str | None = None, force: bool = False) -> list[tuple[dict, str]]:
-    """返回按质量排序的候选 (provider, model) 列表"""
-    
+    """返回按质量排序的候选 (provider, model) 列表。
+
+    排序优先级：
+      ① 健康分层：熔断中 / 近期失败过的候选一律排到最后（force 时不分层）
+      ② 可用率降序（model_quality 滑动窗口，转发结果实时写入）
+      ③ 平均延迟升序（流式 TTFB 样本）
+    不健康的候选不会被丢弃，只是在最后兜底，避免出现"无可用模型"。
+    """
     raw = []
-    unhealthy_raw = []
-    
+
     # 如果请求的是自定义路由组
     if model in ROUTERS:
         target_models = set(ROUTERS[model])
         for p in providers:
             for m in get_enabled_models(p):
                 if m in target_models:
-                    k = f"{p['name']}||{m}"
-                    raw.append((p, m, k))
-        scored = [
-            (get_quality_score(k), get_avg_latency(k) or 1e9, p, m)
-            for p, m, k in raw
-        ]
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [(p, m) for _, _, p, m in scored]
+                    raw.append((p, m, f"{p['name']}||{m}"))
+    else:
+        # 否则按具体模型匹配
+        for p in providers:
+            for m in get_enabled_models(p):
+                prefixed = f"{p['name']}-{m}"
+                if model and model != m and model != prefixed:
+                    continue
+                raw.append((p, m, f"{p['name']}||{m}"))
 
-    # 否则按具体模型匹配
-    for p in providers:
-        for m in get_enabled_models(p):
-            prefixed = f"{p['name']}-{m}"
-            if model and model != m and model != prefixed:
-                continue
-            k = f"{p['name']}||{m}"
-            if force or model:
-                raw.append((p, m, k))
-                continue
-            st = health_status.get(k, {}).get("status")
-            if not is_circuit_open(k) and st in ("ok", None, "unknown"):
-                raw.append((p, m, k))
-            else:
-                unhealthy_raw.append((p, m, k))
-    if not raw:
-        raw = unhealthy_raw
     scored = [
-        (get_quality_score(k), get_avg_latency(k) or 1e9, p, m)
+        (
+            0 if (force or is_healthy(k)) else 1,
+            -get_quality_score(k),
+            get_avg_latency(k) or 1e9,
+            p,
+            m,
+        )
         for p, m, k in raw
     ]
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [(p, m) for _, _, p, m in scored]
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [(p, m) for *_, p, m in scored]
 
 
 def pick_available_model(model: str | None = None, force: bool = False):
@@ -1731,6 +1747,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                     "Content-Type": "application/json",
                 }
 
+                t_start = time.time()  # 用于统计首包耗时（TTFB）
                 req = http_client.build_request("POST", url, json=req_body, headers=headers)
                 try:
                     resp = await http_client.send(req, stream=True)
@@ -1767,11 +1784,14 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
 
                 usage_obj = None
                 stream_ok = True
+                ttfb_ms = None  # 首个数据块到达耗时，作为该上游的延迟样本
 
                 try:
                     async for line in resp.aiter_lines():
                         if not line:
                             continue
+                        if ttfb_ms is None:
+                            ttfb_ms = round((time.time() - t_start) * 1000)
                         if not line.startswith("data: "):
                             yield line + "\n"
                             continue
@@ -1812,7 +1832,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                             yield "data: " + out + "\n\n"
                         except json.JSONDecodeError:
                             yield line + "\n"
-                    record_success(k)
+                    record_success(k, ttfb_ms)
                     try:
                         pt = (usage_obj or {}).get("prompt_tokens", 0) or 0
                         ct = (usage_obj or {}).get("completion_tokens", 0) or 0
@@ -2322,12 +2342,25 @@ if __name__ == "__main__":
         if port_in_use(actual_port):
             break
 
-    # ---- 创建窗口并直接加载页面 ----
+    # ---- 创建窗口并直接加载页面（默认 1200x800，启动后按主屏居中） ----
+    WIN_W, WIN_H = 1200, 800
     url = f'http://127.0.0.1:{actual_port}/'
     window = webview.create_window(
-        'API-N1-Router', url, width=1200, height=800
+        'API-N1-Router', url, width=WIN_W, height=WIN_H
     )
     state["window"] = window
+
+    def center_window():
+        """窗口就绪后按主屏居中；失败则保留系统默认位置。"""
+        try:
+            screen = webview.screens[0]
+            x = int(screen.x) + max(0, (int(screen.width) - WIN_W) // 2)
+            y = int(screen.y) + max(0, (int(screen.height) - WIN_H) // 2)
+            window.move(x, y)
+            logger.info("窗口居中: 屏幕 %s → 位置 (%s, %s) 尺寸 %sx%s",
+                        screen, x, y, WIN_W, WIN_H)
+        except Exception:
+            logger.warning("窗口居中失败，沿用系统默认位置", exc_info=True)
 
     def on_closing():
         if state["quitting"]:
@@ -2341,5 +2374,5 @@ if __name__ == "__main__":
     threading.Thread(target=tray_icon.run, daemon=True).start()
 
     # ---- 启动 webview（关闭隐私模式 + 指定数据目录，持久化 localStorage 以记住主题等设置） ----
-    webview.start(private_mode=False, storage_path=str(DATA_DIR / "webview_data"))
+    webview.start(center_window, private_mode=False, storage_path=str(DATA_DIR / "webview_data"))
 
