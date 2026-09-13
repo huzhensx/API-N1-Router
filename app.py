@@ -57,7 +57,7 @@ USAGE_FILE = DATA_DIR / "usage.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -318,6 +318,16 @@ circuit_breaker: dict = {}        # key -> 熔断状态（临时性错误；含�
 blocked: dict = {}                # key -> 拉黑状态（永久性错误；含探活调度）
 hard_disabled: dict = {}          # key -> 停用到当天零点（不再探活，跨零点自动解除）
 circuit_strikes: dict = {}        # key -> {"day", "count"} 当天进入静默的次数
+
+# 会话粘性（软粘性）：会话指纹 -> 该会话上次成功使用的「上游||模型」
+# 目的：同一会话尽量复用同一个上游，避免"上游还健康、只因质量分/延迟微动就换人"
+#       造成的上下文窗口、prompt 模板、KV 缓存反复变化。
+# 只作为候选排序的**偏好**：目标组合一旦不健康（停用/拉黑/近期失败）立刻失效，
+# 回落到原有排序 —— 容灾触发条件、熔断阈值、候选上限一概不变。
+sticky_sessions: dict = {}
+STICKY_MAX_SESSIONS = 400         # LRU 容量（每会话占用 1~2 个 key），超出淘汰最久未用的
+STICKY_ANCHOR_MSGS = 2            # 长锚点：取对话开头几条（跳过 system）
+
 providers_lock = asyncio.Lock()
 history_lock = asyncio.Lock()
 usage_lock = asyncio.Lock()
@@ -1248,12 +1258,69 @@ class PresetApplyIn(BaseModel):
 
 
 # ============================================================
+# 会话粘性（软粘性）
+# ============================================================
+def session_fingerprints(messages) -> list[str]:
+    """由对话**开头**生成会话指纹，按"精度从高到低"返回。
+
+    返回两个锚点（不足时降级为一个）：
+      · 长锚点 = 前 2 条非 system 消息 → 历史变长后依然稳定，碰撞率低
+      · 短锚点 = 首条非 system 消息   → 会话第一轮只有 1 条消息时也能命中
+
+    查找时按顺序回落、记忆时两个都写，于是"会话第一轮（1 条锚点）→ 第二轮（2 条锚点）"
+    仍能接上同一个上游。system 一律跳过 —— 网关自己会追加/插入中文指令 system。
+
+    稳定性要求：每轮 messages 会不断变长，所以只取开头；取不到锚点时返回空列表，
+    该请求直接不启用粘性（等价于旧行为）。
+    """
+    if not isinstance(messages, list):
+        return []
+    picked: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "system":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):      # 多模态 content 数组 → 只取其中的文本段
+            c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        if not isinstance(c, str) or not c.strip():
+            continue
+        picked.append(f"{m.get('role')}:{' '.join(c.split())}")
+        if len(picked) >= STICKY_ANCHOR_MSGS:
+            break
+    if not picked:
+        return []
+    if len(picked) >= 2:
+        long_fp = hashlib.sha1("\n".join(picked).encode("utf-8")).hexdigest()[:16]
+        short_fp = hashlib.sha1(picked[0].encode("utf-8")).hexdigest()[:16]
+        return [long_fp, short_fp]
+    return [hashlib.sha1(picked[0].encode("utf-8")).hexdigest()[:16]]
+
+
+def remember_sticky(fps, key: str):
+    """记下某会话最近一次**成功**使用的组合（LRU）。失败不记录，也不主动清除。"""
+    if not key or not fps:
+        return
+    for fp in fps:
+        if not fp:
+            continue
+        if fp in sticky_sessions:
+            del sticky_sessions[fp]
+        sticky_sessions[fp] = key
+    while len(sticky_sessions) > STICKY_MAX_SESSIONS:
+        sticky_sessions.pop(next(iter(sticky_sessions)))
+
+
+# ============================================================
 # 模型选择
 # ============================================================
-def pick_available_models(model: str | None = None, force: bool = False) -> list[tuple[dict, str]]:
+def pick_available_models(model: str | None = None, force: bool = False,
+                          sticky: list[str] | None = None) -> list[tuple[dict, str]]:
     """返回按质量排序的候选 (provider, model) 列表。
 
     排序优先级：
+      ⓪ 会话粘性（仅在 sticky 命中且该组合**当前健康**时置顶；命中即跳过续层比较）
       ① 分层：0 = 健康；1 = 近期临时失败（120 秒内）；2 = 拉黑中（永久性错误）
          拉黑项只降到底部、**不丢弃** —— 只有全部候选都被拉黑时才轮得到它们，
          所以永远不会出现"无可用模型"的 503。force=True 时不分层（手动立即检测用）。
@@ -1261,6 +1328,9 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
          无样本 = 中性分 QUALITY_UNKNOWN(0.5)，不会抢在已验证源之前
       ③ 同分时：有验证样本的排在无样本的之前
       ④ 平均延迟升序（流式 TTFB 样本）
+
+    sticky（会话指纹列表，精度从高到低）只影响**偏好**：按顺序回落取第一个命中且健康的目标，
+    取不到就整条失效、回落 ①~④ 原排序，所以它不会降低任一容灾路径的可用性。
     """
     raw = []
 
@@ -1280,8 +1350,19 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
                     continue
                 raw.append((p, m, f"{p['name']}||{m}"))
 
+    # 会话粘性目标：必须同时满足「候选里确实有它」+「当前健康（未停用/未拉黑/非近期失败）」
+    # 任一不满足就置空 → 排序与不带粘性时逐字节一致。指纹按精度从高到低回落。
+    sticky_target = ""
+    if sticky and not force:
+        for _fp in sticky:
+            cand = sticky_sessions.get(_fp) or ""
+            if cand and is_healthy(cand) and any(k == cand for _p, _m, k in raw):
+                sticky_target = cand
+                break
+
     scored = [
         (
+            0 if (sticky_target and k == sticky_target) else 1,
             0 if force else (2 if is_disabled(k) else (0 if is_healthy(k) else 1)),
             -get_quality_score(k),
             0 if has_quality_data(k) else 1,
@@ -1291,7 +1372,7 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
         )
         for p, m, k in raw
     ]
-    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
     return [(p, m) for *_, p, m in scored]
 
 
@@ -2155,7 +2236,7 @@ def _inject_cn_hint(body: dict):
 # ============================================================
 # 代理（客户端鉴权）
 # ============================================================
-async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
+async def _stream_with_failover(candidates, body, is_router, prelude: str = "", sticky_fp: str = ""):
     """流式转发，中断时自动切换下一个候选模型继续输出。prelude 为先输出给用户的提示文本。"""
 
     async def gen():
@@ -2273,6 +2354,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                         except json.JSONDecodeError:
                             yield line + "\n"
                     record_success(k, ttfb_ms)
+                    remember_sticky(sticky_fp, k)   # 本会话下次优先复用这个上游
                     try:
                         pt = (usage_obj or {}).get("prompt_tokens", 0) or 0
                         ct = (usage_obj or {}).get("completion_tokens", 0) or 0
@@ -2324,6 +2406,8 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
 @app.api_route("/v1/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
 async def proxy_chat(request: Request, force: bool = False):
     body = await request.json()
+    # 会话指纹必须在任何改写之前算：compress_hermes / ensure_lang_reply 都会改动 messages
+    session_fps = session_fingerprints(body.get("messages"))
     body = compress_hermes(body)
     body = ensure_lang_reply(body)
     requested_model = body.get("model")
@@ -2350,7 +2434,7 @@ async def proxy_chat(request: Request, force: bool = False):
         else:
             raise HTTPException(503, "识图辅助已开启，但未配置识图路由组，无法处理图片。")
 
-    candidates = pick_available_models(requested_model, force=force)
+    candidates = pick_available_models(requested_model, force=force, sticky=session_fps)
     if not candidates:
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
 
@@ -2361,12 +2445,17 @@ async def proxy_chat(request: Request, force: bool = False):
         candidates = candidates[:MAX_CANDIDATE_TRIES]
 
     # 只打印「上游名||模型名」；绝不打印 provider 字典（那里面含 api_key 明文）
+    _first_key = f"{candidates[0][0].get('name')}||{candidates[0][1]}" if candidates else None
+    _sticky_note = ""
+    if _first_key and any(sticky_sessions.get(_f) == _first_key for _f in session_fps):
+        _sticky_note = " [sticky]"       # 本会话复用了上次成功的上游（软粘性命中）
     logger.info(
-        "Request: model=%s → candidates=%d%s, first=%s",
+        "Request: model=%s → candidates=%d%s, first=%s%s",
         requested_model,
         total_candidates,
         f" (尝试前 {len(candidates)})" if len(candidates) != total_candidates else "",
-        f"{candidates[0][0].get('name')}||{candidates[0][1]}" if candidates else None,
+        _first_key,
+        _sticky_note,
     )
 
     is_router = requested_model in ROUTERS
@@ -2374,7 +2463,8 @@ async def proxy_chat(request: Request, force: bool = False):
     last_err = None
 
     if stream:
-        return await _stream_with_failover(candidates, body, is_router, prelude=vision_prelude)
+        return await _stream_with_failover(candidates, body, is_router,
+                                           prelude=vision_prelude, sticky_fp=session_fps)
 
     for attempt in (2,) if is_router else (1,):
         for provider, model in candidates:
@@ -2409,6 +2499,7 @@ async def proxy_chat(request: Request, force: bool = False):
                     parsed_str = restore_hermes_text(parsed_str)
                     parsed = json.loads(parsed_str)
                     record_success(k)
+                    remember_sticky(session_fps, k)   # 本会话下次优先复用这个上游
                     # 同流式：model 字段回填为客户端原始请求名，避免客户端判定"模型已切换"
                     if body.get("model"):
                         parsed["model"] = body["model"]
