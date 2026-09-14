@@ -559,6 +559,12 @@ input:checked + .slider:before { transform: translateX(14px); }
 .router-card-title .router-card-hint {
   font-size: 11px; color: var(--text-secondary); font-weight: 400;
 }
+.router-vision-badge {
+  flex: 0 0 auto; white-space: nowrap;
+  padding: 3px 10px; font-size: 11px; line-height: 1.5;
+  color: var(--text-secondary);
+  border: 1px solid var(--mac-border); border-radius: 6px;
+}
 .router-card-del {
   flex: 0 0 auto; white-space: nowrap;
   padding: 3px 10px; font-size: 11px; line-height: 1.5;
@@ -1101,15 +1107,21 @@ input:checked + .slider:before { transform: translateX(14px); }
       <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; margin-bottom:14px; border:1px solid var(--mac-border); border-radius:8px; background:var(--mac-border);">
         <div style="font-size:13px;">
           <div style="font-weight:600;">识图辅助开关</div>
-          <div style="color:var(--text-secondary); font-size:11px; margin-top:2px; line-height:1.5;">开启后，对话带图片时自动用视觉模型识别内容（默认关闭）。注意：开启此功能后，模型需先调用视觉模型识别图片，回复时间会明显变慢。</div>
-          <div style="color:var(--text-secondary); font-size:11px; margin-top:4px; line-height:1.5;">下方请勾选<b style="color:var(--text-primary);">仅支持图片识别</b>的模型；如不清楚该选哪些，请截图咨询 AI。</div>
+          <div style="color:var(--text-secondary); font-size:11px; margin-top:2px; line-height:1.5;">开启后，含图片的对话走<b style="color:var(--text-primary);">两段式</b>：先由识图组把图片转成文字描述，再把描述交给你的目标路由组回复。已识别的图片按内容缓存，同一张图不会重复识别（网关重启后缓存失效需重识别一次）。注意：首次识别会增加等待时间。</div>
+          <div style="color:var(--text-secondary); font-size:11px; margin-top:4px; line-height:1.5;">若目标路由组<b style="color:var(--text-primary);">本身含多模态模型</b>（下方标记为可识图的模型），图片会直接交给它读，不经过识图组。</div>
+          <div style="color:var(--text-secondary); font-size:11px; margin-top:4px; line-height:1.5;">下方请勾选<b style="color:var(--text-primary);">支持图片识别</b>的模型；如不清楚该选哪些，请截图咨询 AI。</div>
         </div>
         <label class="switch-inline">
           <input type="checkbox" id="visionAssistSwitch" onchange="toggleVisionAssist(this)">
           <span class="slider-inline"></span>
         </label>
       </div>
-      <div class="preset-intro">勾选作为"识图"路由组成员的模型。客户端 <code>model</code> 填 <code>识图</code> 即在组内轮询。</div>
+      <div style="display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+        <span style="font-size:12px; color:var(--text-secondary); white-space:nowrap;">识图组名</span>
+        <select id="visionGroupSelect" onchange="onVisionGroupChange(this)" style="padding: 5px 10px; border-radius: 6px; border: 1px solid var(--mac-border); background: transparent; color: var(--text-primary); font-size: 13px; outline: none; min-width: 140px;"></select>
+        <span style="font-size:11px; color:var(--text-secondary);">客户端 <code>model</code> 填这个名称即命中该组；该组不可删除</span>
+      </div>
+      <div class="preset-intro">勾选作为<b style="color:var(--text-primary);">识图组</b>成员的模型（两段式的第一段由它们在组内轮询执行；全都失败时本轮直接中断）。</div>
       <div id="visionList" style="display:flex; flex-direction:column; gap:6px; max-height:420px; overflow-y:auto;"></div>
     </div>
     <div class="modal-footer">
@@ -2127,14 +2139,39 @@ function fmtCtx(n) {
 let routersData = {};
 let allModelOptions = [];   // [{provider, model}]
 
+let _visionGroupName = '识图';
+
 async function loadVisionAssist() {
   try {
     const r = await apiFetch('/api/vision-assist');
     const d = await r.json();
     document.getElementById('visionAssistSwitch').checked = !!d.enabled;
+    _visionGroupName = d.group || '识图';
   } catch (e) {
     document.getElementById('visionAssistSwitch').checked = false;
+    _visionGroupName = '识图';
   }
+  renderVisionGroupSelect();
+}
+
+/* 识图组名下拉框：选项取自现有路由组；若当前配置的名字不在其中（例如该组还没建），也补进去。
+   组名存在 config.json（不是 routers.json），所以换名不会丢该组的成员模型。 */
+function renderVisionGroupSelect() {
+  const sel = document.getElementById('visionGroupSelect');
+  if (!sel) return;
+  const names = Object.keys(routersData || {});
+  if (!names.includes(_visionGroupName)) names.unshift(_visionGroupName);
+  sel.innerHTML = names.map(n => `<option value="${n}"${n === _visionGroupName ? ' selected' : ''}>${n}</option>`).join('');
+  sel.value = _visionGroupName;
+}
+
+/* 切换识图组名：下方勾选状态要跟着换成新组的成员 */
+function onVisionGroupChange(sel) {
+  _visionGroupName = sel.value || '识图';
+  const selected = new Set((routersData || {})[_visionGroupName] || []);
+  document.querySelectorAll('.vision-cb').forEach(cb => { cb.checked = selected.has(cb.value); });
+  const cnt = document.getElementById('visionCount');
+  if (cnt) cnt.textContent = '已选 ' + selected.size + ' · 共 ' + document.querySelectorAll('.vision-cb').length + ' 个模型';
 }
 
 async function toggleVisionAssist(el) {
@@ -2200,7 +2237,7 @@ async function openRouterManager() {
 let _visionModelSet = new Set();
 async function openVisionConfig() {
   document.getElementById('visionModal').classList.add('show');
-  loadVisionAssist();
+  await loadVisionAssist();
   const list = document.getElementById('visionList');
   list.innerHTML = '<div class="empty">加载中…</div>';
   document.getElementById('visionCount').textContent = '';
@@ -2215,7 +2252,8 @@ async function openVisionConfig() {
     providers.forEach(p => (p.models || []).forEach(m => opts.push({ provider: p.name, model: m })));
     routersData = rr.data || {};
     _visionModelSet = new Set(vr.data || []);
-    const selected = new Set(routersData['识图'] || []);
+    renderVisionGroupSelect();
+    const selected = new Set(routersData[_visionGroupName] || []);
     if (!opts.length) {
       list.innerHTML = '<div class="empty" style="color:var(--danger)">未获取到模型，请先在一键配置或上游管理对接 API Key</div>';
       return;
@@ -2237,13 +2275,23 @@ async function openVisionConfig() {
 async function saveVisionConfig() {
   const selected = [];
   document.querySelectorAll('.vision-cb:checked').forEach(cb => selected.push(cb.value));
+  const sel = document.getElementById('visionGroupSelect');
+  const group = (sel && sel.value) || _visionGroupName || '识图';
   try {
+    // ① 组名存 config.json
+    await apiFetch('/api/vision-assist', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group })
+    });
+    _visionGroupName = group;
+    // ② 该组的成员模型存 routers.json
     const rr = await (await apiFetch('/api/routers')).json();
     const all = rr.data || {};
-    all['识图'] = selected;
+    all[group] = selected;
     await apiFetch('/api/routers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(all) });
     routersData = all;
-    showToast('识图模型已保存', 'ok');
+    showToast('识图配置已保存（识图组：' + group + '）', 'ok');
     closeVisionConfig();
   } catch (e) {
     showToast('保存失败：' + e.message, 'error');
@@ -2284,10 +2332,15 @@ function renderRouterList() {
         <div class="model-checkbox-label"><span class="model-provider-badge">${opt.provider}</span><span class="router-model-name" title="${opt.model}">${opt.model}</span><span class="router-model-ctx">${ctxStr}</span></div>
       </label>`;
     }).join('');
+    // 识图组不可删除：它的成员由「识图配置」弹窗管理，整组删掉会让识图辅助直接失效
+    const isVisionGroup = (name === _visionGroupName);
+    const headAction = isVisionGroup
+      ? `<span class="router-vision-badge" title="该组由「识图配置」管理，不可删除">识图辅助专用</span>`
+      : `<button class="btn router-card-del" onclick="removeRouterGroup('${name}')">删除</button>`;
     return `<div class="router-card">
       <div class="router-card-head">
         <div class="router-card-title">🔀 ${name} <span class="router-card-hint">(客户端 model 字段填这个名称即可命中)</span></div>
-        <button class="btn router-card-del" onclick="removeRouterGroup('${name}')">删除</button>
+        ${headAction}
       </div>
       <div class="router-card-body">${boxes}</div>
     </div>`;
