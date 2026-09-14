@@ -35,7 +35,9 @@
     "OpenGVLab/InternVL3_5-241B-A28B": true,
     "Qwen/Qwen3-VL-8B-Thinking": true,
     "Qwen/Qwen3-VL-8B-Instruct": true,
-    "PaddlePaddle/ERNIE-4.5-VL-28B-A3B-PT": true
+    "PaddlePaddle/ERNIE-4.5-VL-28B-A3B-PT": true,
+    "Qwen/Qwen3-VL-235B-A22B-Instruct": true,
+    "DeepSeek-V4-Flash-Vision-Exp": true
   },
   "non_chat_keywords": [
     "embed",

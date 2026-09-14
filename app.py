@@ -57,7 +57,7 @@ USAGE_FILE = DATA_DIR / "usage.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -2385,7 +2385,10 @@ async def describe_image(url: str) -> str:
         except Exception as e:
             record_fail(k, code=0)
             last_err = f"{provider['name']} {e.__class__.__name__}"
-            logger.warning("vision describe error from %s: %s", provider["name"], e)
+            # str(e) 对超时/DNS/TLS 类异常常为空串，光有 provider 名无法定位 ⇒ 必须带上类型名
+            logger.warning("vision describe error from %s: %s: %s",
+                           provider["name"], e.__class__.__name__,
+                           str(e).strip() or "(异常文本为空)")
 
     raise HTTPException(502, f"识图组「{group}」全部候选均失败（{last_err}），本轮已中断。")
 
@@ -2608,6 +2611,12 @@ async def proxy_chat(request: Request, force: bool = False):
     if vision_enabled and image_urls and not is_vision_request:
         fp = _vision_fingerprint(body)
         announce = _should_announce_vision(fp)
+        if announce:
+            # 诊断：坐实客户端是否把同一张图拆成多个 image_url 部件回传。
+            # md5 相同 = 同一张图（只会真识别一次）；只在播报那一轮打，避免每轮刷屏。
+            logger.info("Vision parts: %s", ", ".join(
+                f"#{i + 1} md5={_image_key(u)[:8]} len={len(u)}"
+                for i, u in enumerate(image_urls)))
 
         if requested_model in ROUTERS:
             for _p, _m in pick_available_models(requested_model):
@@ -2633,10 +2642,13 @@ async def proxy_chat(request: Request, force: bool = False):
                 if _k not in descs:
                     descs[_k] = await describe_image(_u)
             replaced = apply_vision_descriptions(body, descs)
-            logger.info("Vision two-stage: model=%s, fp=%s, images=%d, replaced=%d, announce=%s",
-                        requested_model, fp, len(image_urls), replaced, announce)
+            # replaced 是「被替换的 image_url 部件数」，同一张图回传多份会重复计数；
+            # 用户的感知单位是「几张图」⇒ 播报用去重后的 len(descs)。
+            n_images = len(descs)
+            logger.info("Vision two-stage: model=%s, fp=%s, parts=%d, unique=%d, replaced=%d, announce=%s",
+                        requested_model, fp, len(image_urls), n_images, replaced, announce)
             if announce:
-                vision_prelude = f"🖼️ 已完成 {replaced} 张图片的识别，转由 {requested_model} 回复…\n\n"
+                vision_prelude = f"🖼️ 已完成 {n_images} 张图片的识别，转由 {requested_model} 回复…\n\n"
 
     # 直通路径下候选池收敛为多模态成员：图片在手，交给不支持视觉的模型必然上游 400
     candidates = pick_available_models(requested_model, force=force, sticky=session_fps,
@@ -2861,24 +2873,79 @@ async def update_port(request: Request, _=Depends(verify_admin)):
 
 
 # ============================================================
-# 开机自启动
+# 开机自启动（「启动」文件夹快捷方式；本程序不写注册表）
 # ============================================================
-STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-VALUE_NAME = "APIN1Router"
+# 旧版把自启项写进 HKCU\...\Run（值名 APIN1Router）。现改为在用户「启动」文件夹
+# 放一个 .lnk：零依赖、无控制台闪窗、删除即失效，且完全不碰注册表。
+STARTUP_LNK_NAME = "API-N1-Router.lnk"
+LEGACY_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+LEGACY_RUN_VALUE = "APIN1Router"
+
+
+def startup_lnk_path() -> str:
+    """用户「启动」文件夹里本程序的快捷方式路径。"""
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                        "Programs", "Startup", STARTUP_LNK_NAME)
+
+
+def legacy_registry_autostart() -> bool:
+    """只读探测：旧版写在注册表里的自启项是否仍在（本程序绝不写注册表）。"""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, LEGACY_RUN_KEY, 0,
+                             winreg.KEY_READ)
+    except OSError:
+        return False
+    try:
+        winreg.QueryValueEx(key, LEGACY_RUN_VALUE)
+        return True
+    except OSError:
+        return False
+    finally:
+        winreg.CloseKey(key)
+
+
+def _quote_ps(s: str) -> str:
+    """转义 PowerShell 单引号字符串。"""
+    return str(s).replace("'", "''")
+
+
+def _write_startup_lnk() -> None:
+    """借系统自带 PowerShell 的 WScript.Shell 生成 .lnk，不安装任何依赖。"""
+    target = os.path.abspath(sys.executable)
+    lnk = startup_lnk_path()
+    os.makedirs(os.path.dirname(lnk), exist_ok=True)
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+        "$s.TargetPath = '{tgt}';"
+        "$s.WorkingDirectory = '{wd}';"
+        "$s.IconLocation = '{tgt},0';"
+        "$s.Description = 'API-N1-Router';"
+        "$s.Save()"
+    ).format(lnk=_quote_ps(lnk), tgt=_quote_ps(target),
+             wd=_quote_ps(os.path.dirname(target)))
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if not os.path.exists(lnk):
+        detail = (r.stderr or r.stdout or "").strip()[:200] or f"exit={r.returncode}"
+        raise RuntimeError(f"创建启动快捷方式失败：{detail}")
+
+
+def _remove_startup_lnk() -> None:
+    try:
+        os.remove(startup_lnk_path())
+    except FileNotFoundError:
+        pass
 
 
 @app.get("/api/autostart")
 async def get_autostart(_=Depends(verify_admin)):
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0,
-                            winreg.KEY_READ)
-        winreg.QueryValueEx(key, VALUE_NAME)
-        winreg.CloseKey(key)
-        return {"enabled": True}
-    except FileNotFoundError:
-        return {"enabled": False}
-    except Exception:
-        return {"enabled": False}
+    return {"enabled": os.path.exists(startup_lnk_path()),
+            "legacy_registry": legacy_registry_autostart()}
 
 
 @app.post("/api/autostart")
@@ -2886,19 +2953,12 @@ async def set_autostart(request: Request, _=Depends(verify_admin)):
     body = await request.json()
     enabled = bool(body.get("enabled", False))
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0,
-                            winreg.KEY_SET_VALUE)
         if enabled:
-            exe_path = sys.executable
-            winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ,
-                            f'"{exe_path}"')
+            _write_startup_lnk()
         else:
-            try:
-                winreg.DeleteValue(key, VALUE_NAME)
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-        return {"ok": True, "enabled": enabled}
+            _remove_startup_lnk()
+        return {"ok": True, "enabled": os.path.exists(startup_lnk_path()),
+                "legacy_registry": legacy_registry_autostart()}
     except Exception as e:
         raise HTTPException(500, f"操作失败: {e}")
 

@@ -565,6 +565,24 @@ input:checked + .slider:before { transform: translateX(14px); }
   color: var(--text-secondary);
   border: 1px solid var(--mac-border); border-radius: 6px;
 }
+/* 识图弹窗「识图组名」下拉：该 select 不在 .filter-bar 内，取不到那边的深色规则，
+   必须单独适配 —— 关键是 color-scheme: dark（否则弹出的列表按浅色渲染）+ option 配色 */
+.vision-group-select {
+  padding: 5px 10px; border-radius: 6px; font-size: 13px;
+  min-width: 140px; font-family: inherit; outline: none; cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--mac-border);
+  color: var(--text-primary);
+}
+[data-theme="dark"] .vision-group-select {
+  color-scheme: dark;
+  background: #1c1c1e;
+  border: 1px solid var(--mac-border);
+  color: #ffffff;
+}
+[data-theme="dark"] .vision-group-select option {
+  background: #1c1c1e; color: #ffffff;
+}
 .router-card-del {
   flex: 0 0 auto; white-space: nowrap;
   padding: 3px 10px; font-size: 11px; line-height: 1.5;
@@ -1118,7 +1136,7 @@ input:checked + .slider:before { transform: translateX(14px); }
       </div>
       <div style="display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
         <span style="font-size:12px; color:var(--text-secondary); white-space:nowrap;">识图组名</span>
-        <select id="visionGroupSelect" onchange="onVisionGroupChange(this)" style="padding: 5px 10px; border-radius: 6px; border: 1px solid var(--mac-border); background: transparent; color: var(--text-primary); font-size: 13px; outline: none; min-width: 140px;"></select>
+        <select id="visionGroupSelect" class="vision-group-select" onchange="onVisionGroupChange(this)"></select>
         <span style="font-size:11px; color:var(--text-secondary);">客户端 <code>model</code> 填这个名称即命中该组；该组不可删除</span>
       </div>
       <div class="preset-intro">勾选作为<b style="color:var(--text-primary);">识图组</b>成员的模型（两段式的第一段由它们在组内轮询执行；全都失败时本轮直接中断）。</div>
@@ -2975,6 +2993,10 @@ async function loadAutostart() {
     const d = await r.json();
     document.getElementById('settingsAutostart').checked = d.enabled;
     document.getElementById('autostartLabel').textContent = d.enabled ? '已开启' : '开机自启';
+    // 旧版把自启项写在注册表里；若仍残留，即便开关是关的也会开机启动 → 提示手动清掉
+    if (d.legacy_registry) {
+      showToast('检测到旧版注册表自启项，请在「任务管理器 → 启动」中禁用它', 'error');
+    }
   } catch (e) {}
 }
 startApp();
